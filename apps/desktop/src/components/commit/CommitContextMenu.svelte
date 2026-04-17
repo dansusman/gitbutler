@@ -42,6 +42,8 @@
 
 <script lang="ts">
 	import IrcSendToSubmenus from "$components/diff/IrcSendToSubmenus.svelte";
+	import { ANNOTATION_SERVICE, type AnnotationContext } from "$lib/annotations/annotationService.svelte";
+	import { BACKEND } from "$lib/backend";
 	import { CLIPBOARD_SERVICE } from "$lib/backend/clipboard";
 	import { URL_SERVICE } from "$lib/backend/url";
 	import { rewrapCommitMessage } from "$lib/config/uiFeatureFlags";
@@ -61,6 +63,7 @@
 		ContextMenuSection,
 		KebabButton,
 		TestId,
+		chipToasts,
 	} from "@gitbutler/ui";
 	import type { AnchorPosition } from "$lib/stacks/stack";
 
@@ -81,6 +84,8 @@
 	}: Props = $props();
 
 	const urlService = inject(URL_SERVICE);
+	const backend = inject(BACKEND);
+	const annotationService = inject(ANNOTATION_SERVICE);
 	const stackService = inject(STACK_SERVICE);
 	const clipboardService = inject(CLIPBOARD_SERVICE);
 	const modeService = injectOptional(MODE_SERVICE, undefined);
@@ -234,6 +239,21 @@
 						}}
 					/>
 				{/if}
+				<ContextMenuItem
+					label="Open in Xcode"
+					icon="open-in-ide"
+					onclick={async () => {
+						try {
+							const project = await projectsService.fetchProject(projectId);
+							if (project?.path) {
+								await backend.invoke("open_in_xcode", { path: project.path, line: null });
+							}
+						} catch {
+							chipToasts.error("Failed to open in Xcode");
+						}
+						close();
+					}}
+				/>
 				<ContextMenuItemSubmenu label="Copy" icon="copy">
 					{#snippet submenu({ close: closeSubmenu })}
 						<ContextMenuSection>
@@ -332,6 +352,88 @@
 					onSend={(target) => sendCommitToChannel(target, commitId, commitMessage, ctxStackId)}
 					closeMenu={close}
 				/>
+			{/if}
+
+			{@const annotationCtx: AnnotationContext = { type: 'commit', commitId }}
+			{@const ctxCount = annotationService.countForContext(annotationCtx)}
+			{#if annotationService.count > 0}
+				<ContextMenuSection>
+					{#if ctxCount > 0}
+						<ContextMenuItem
+							label="Export annotations for this commit ({ctxCount})"
+							icon="copy"
+							onclick={async () => {
+								const md = annotationService.toMarkdown(annotationCtx, commitMessage);
+								try {
+									const { save } = await import("@tauri-apps/plugin-dialog");
+									const { writeTextFile } = await import("@tauri-apps/plugin-fs");
+									const filePath = await save({
+										defaultPath: "annotations.md",
+										filters: [{ name: "Markdown", extensions: ["md"] }],
+									});
+									if (filePath) {
+										await writeTextFile(filePath, md);
+										chipToasts.success(`Annotations exported to ${filePath}`);
+									}
+								} catch (err) {
+									console.error("Failed to export annotations", err);
+									chipToasts.error("Failed to export annotations");
+								}
+								close();
+							}}
+						/>
+						<ContextMenuItem
+							label="Copy annotations for this commit"
+							icon="copy"
+							onclick={() => {
+								const md = annotationService.toMarkdown(annotationCtx, commitMessage);
+								clipboardService.write(md, { message: "Annotations copied to clipboard" });
+								close();
+							}}
+						/>
+					{/if}
+					<ContextMenuItem
+						label="Export all annotations ({annotationService.count})"
+						icon="copy"
+						onclick={async () => {
+							const md = annotationService.toMarkdownAll();
+							try {
+								const { save } = await import("@tauri-apps/plugin-dialog");
+								const { writeTextFile } = await import("@tauri-apps/plugin-fs");
+								const filePath = await save({
+									defaultPath: "annotations.md",
+									filters: [{ name: "Markdown", extensions: ["md"] }],
+								});
+								if (filePath) {
+									await writeTextFile(filePath, md);
+									chipToasts.success(`Annotations exported to ${filePath}`);
+								}
+							} catch (err) {
+								console.error("Failed to export annotations", err);
+								chipToasts.error("Failed to export annotations");
+							}
+							close();
+						}}
+					/>
+					<ContextMenuItem
+						label="Copy all annotations to clipboard"
+						icon="copy"
+						onclick={() => {
+							const md = annotationService.toMarkdownAll();
+							clipboardService.write(md, { message: "Annotations copied to clipboard" });
+							close();
+						}}
+					/>
+					<ContextMenuItem
+						label="Clear all annotations"
+						icon="bin"
+						onclick={() => {
+							annotationService.clear();
+							chipToasts.success("All annotations cleared");
+							close();
+						}}
+					/>
+				</ContextMenuSection>
 			{/if}
 
 			<ContextMenuSection>

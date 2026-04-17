@@ -36,6 +36,7 @@
 		minWidth: number;
 		lockWarning?: Snippet<[DependencyLock[]]>;
 		hunkHasLocks?: boolean;
+		annotHighlightRange?: { oldRange?: { startLine: number; endLine: number }; newRange?: { startLine: number; endLine: number } };
 	}
 
 	const {
@@ -53,6 +54,7 @@
 		minWidth,
 		lockWarning,
 		hunkHasLocks,
+		annotHighlightRange,
 	}: Props = $props();
 
 	let stagingColumnWidth = $state<number>(0);
@@ -60,6 +62,26 @@
 	const locked = $derived(row.locks !== undefined && row.locks.length > 0);
 	const clickable = $derived(isClickable);
 	const isSelectingForCommit = $derived(staged !== undefined && !hideCheckboxes);
+
+	const annotDragHighlight = $derived.by(() => {
+		const start = lineSelection.annotDragStartIdx;
+		const end = lineSelection.annotDragEndIdx;
+		if (start !== undefined && end !== undefined) {
+			const lo = Math.min(start, end);
+			const hi = Math.max(start, end);
+			if (idx >= lo && idx <= hi) return true;
+		}
+		if (annotHighlightRange) {
+			const { oldRange, newRange } = annotHighlightRange;
+			if (oldRange && row.beforeLineNumber !== undefined) {
+				if (row.beforeLineNumber >= oldRange.startLine && row.beforeLineNumber <= oldRange.endLine) return true;
+			}
+			if (newRange && row.afterLineNumber !== undefined) {
+				if (row.afterLineNumber >= newRange.startLine && row.afterLineNumber <= newRange.endLine) return true;
+			}
+		}
+		return false;
+	});
 </script>
 
 {#snippet countColumn(side: CountColumnSide)}
@@ -100,6 +122,7 @@
 	id={getHunkLineId(row.encodedLineId)}
 	class="table__row"
 	class:selected={row.isSelected}
+	class:annot-drag-highlight={annotDragHighlight}
 	data-test-staged={staged}
 	data-no-drag
 	style="--diff-font: {diffFont};"
@@ -369,6 +392,29 @@
 
 	.diff-line-deletion {
 		background-color: var(--diff-deletion-line-bg);
+	}
+
+	.annot-drag-highlight .table__textContent {
+		background-color: color-mix(in srgb, var(--fill-warn-bg) 40%, var(--bg-1));
+	}
+
+	:global(.dark) .annot-drag-highlight .table__textContent {
+		background-color: color-mix(in srgb, var(--fill-warn-bg) 25%, var(--bg-1));
+	}
+
+	.annot-drag-highlight .table__numberColumn {
+		background-color: color-mix(in srgb, var(--fill-warn-bg) 30%, var(--diff-count-bg));
+		color: var(--diff-count-text);
+	}
+
+	.annot-drag-highlight .table__numberColumn.diff-line-addition {
+		background-color: color-mix(in srgb, var(--fill-warn-bg) 30%, var(--diff-count-bg));
+		color: var(--diff-count-text);
+	}
+
+	.annot-drag-highlight .table__numberColumn.diff-line-deletion {
+		background-color: color-mix(in srgb, var(--fill-warn-bg) 30%, var(--diff-count-bg));
+		color: var(--diff-count-text);
 	}
 
 	.table__row-checkbox {

@@ -11,7 +11,21 @@ export interface LineSelectionParams {
 	rows: Row[] | undefined;
 }
 
+export interface LineRange {
+	startLine: number;
+	endLine: number;
+}
+
+export interface LineDragEndParams {
+	oldRange: LineRange | undefined;
+	newRange: LineRange | undefined;
+	startIdx: number;
+	endIdx: number;
+	rows: Row[] | undefined;
+}
+
 type ToggleLineSelectionFn = (params: LineSelectionParams) => void;
+type LineDragEndFn = (params: LineDragEndParams) => void;
 
 interface TouchCoords {
 	x: number;
@@ -26,8 +40,27 @@ export default class LineSelection {
 	private _selectionStart = $state<number>();
 	private _selectionEnd = $state<number>();
 	private onLineClick: ToggleLineSelectionFn | undefined;
+	private onDragEnd: LineDragEndFn | undefined;
+	private _annotDragStartIdx = $state<number | undefined>();
+	private _annotDragEndIdx = $state<number | undefined>();
 
-	constructor() {}
+	get annotDragStartIdx() {
+		return this._annotDragStartIdx;
+	}
+
+	get annotDragEndIdx() {
+		return this._annotDragEndIdx;
+	}
+
+	constructor() {
+		if (typeof document !== 'undefined') {
+			document.addEventListener('mouseup', () => {
+				if (this._selectionStart !== undefined) {
+					this.onEnd();
+				}
+			});
+		}
+	}
 
 	setRows(rows: Row[]) {
 		this.rows = rows;
@@ -37,6 +70,10 @@ export default class LineSelection {
 		this.onLineClick = fn;
 	}
 
+	setOnDragEnd(fn: LineDragEndFn | undefined) {
+		this.onDragEnd = fn;
+	}
+
 	onStart(ev: MouseEvent, row: Row, index: number) {
 		if (ev.buttons !== 1) return;
 		if (this.mobileTouchDevice) return;
@@ -44,6 +81,10 @@ export default class LineSelection {
 		ev.stopPropagation();
 
 		this._selectionStart = index;
+		if (this.onDragEnd) {
+			this._annotDragStartIdx = index;
+			this._annotDragEndIdx = index;
+		}
 		this.onLineClick?.({
 			index,
 			oldLine: row.beforeLineNumber,
@@ -63,6 +104,9 @@ export default class LineSelection {
 			ev.stopPropagation();
 
 			this._selectionEnd = index;
+			if (this.onDragEnd) {
+				this._annotDragEndIdx = index;
+			}
 			this.onLineClick?.({
 				index,
 				oldLine: row.beforeLineNumber,
@@ -76,10 +120,49 @@ export default class LineSelection {
 	}
 
 	onEnd() {
+		if (this._selectionStart !== undefined && this.onDragEnd && this.rows) {
+			const endIdx = this._selectionEnd ?? this._selectionStart;
+			const lo = Math.min(this._selectionStart, endIdx);
+			const hi = Math.max(this._selectionStart, endIdx);
+			const selectedRows = this.rows.slice(lo, hi + 1);
+
+			let oldMin: number | undefined;
+			let oldMax: number | undefined;
+			let newMin: number | undefined;
+			let newMax: number | undefined;
+
+			for (const r of selectedRows) {
+				if (r.beforeLineNumber !== undefined) {
+					oldMin = oldMin === undefined ? r.beforeLineNumber : Math.min(oldMin, r.beforeLineNumber);
+					oldMax = oldMax === undefined ? r.beforeLineNumber : Math.max(oldMax, r.beforeLineNumber);
+				}
+				if (r.afterLineNumber !== undefined) {
+					newMin = newMin === undefined ? r.afterLineNumber : Math.min(newMin, r.afterLineNumber);
+					newMax = newMax === undefined ? r.afterLineNumber : Math.max(newMax, r.afterLineNumber);
+				}
+			}
+
+			const oldRange = oldMin !== undefined && oldMax !== undefined
+				? { startLine: oldMin, endLine: oldMax } : undefined;
+			const newRange = newMin !== undefined && newMax !== undefined
+				? { startLine: newMin, endLine: newMax } : undefined;
+
+			if (oldRange || newRange) {
+				this.onDragEnd({
+					oldRange,
+					newRange,
+					startIdx: lo,
+					endIdx: hi,
+					rows: this.rows,
+				});
+			}
+		}
 		this._touchMove = undefined;
 		this._touchStart = undefined;
 		this._selectionStart = undefined;
 		this._selectionEnd = undefined;
+		this._annotDragStartIdx = undefined;
+		this._annotDragEndIdx = undefined;
 	}
 
 	onTouchStart(ev: TouchEvent) {

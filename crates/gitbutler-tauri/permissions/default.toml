@@ -161,6 +161,7 @@ commands.allow = [
   "move_commit",
   "normalize_branch_name",
   "open_in_terminal",
+  "open_in_xcode",
   "open_project_in_window",
   "open_url",
   "operating_mode",

@@ -1,4 +1,5 @@
 import { ActionService, ACTION_SERVICE } from "$lib/actions/actionService.svelte";
+import { AnnotationService, ANNOTATION_SERVICE } from "$lib/annotations/annotationService.svelte";
 import {
 	PromptService as AIPromptService,
 	PROMPT_SERVICE as AI_PROMPT_SERVICE,
@@ -71,6 +72,7 @@ import { USER } from "$lib/user/user";
 import { USER_SERVICE, UserService } from "$lib/user/userService";
 import { WorktreeService, WORKTREE_SERVICE } from "$lib/worktree/worktreeService.svelte";
 import { provideAll } from "@gitbutler/core/context";
+
 import { FeedService, FEED_SERVICE } from "@gitbutler/shared/feeds/service";
 import { HttpClient, HTTP_CLIENT } from "@gitbutler/shared/network/httpClient";
 import {
@@ -312,6 +314,7 @@ export function initDependencies(args: {
 
 	const urlService = new URLService(backend);
 	const clipboardService = new ClipboardService(backend);
+	const annotationService = new AnnotationService();
 	const externalLinkService = {
 		open: async (url) => await urlService.openExternalUrl(url),
 	} satisfies ExternalLinkService;
@@ -322,6 +325,7 @@ export function initDependencies(args: {
 
 	provideAll([
 		[ACTION_SERVICE, actionService],
+		[ANNOTATION_SERVICE, annotationService],
 		[AI_PROMPT_SERVICE, aiPromptService],
 		[AI_SERVICE, aiService],
 		[APP_DISPATCH, appState.appDispatch],

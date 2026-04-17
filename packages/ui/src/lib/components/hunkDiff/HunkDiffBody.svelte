@@ -1,6 +1,6 @@
 <script lang="ts">
 	import HunkDiffRow, { type ContextMenuParams } from "$components/hunkDiff/HunkDiffRow.svelte";
-	import LineSelection from "$components/hunkDiff/lineSelection.svelte";
+	import LineSelection, { type LineDragEndParams } from "$components/hunkDiff/lineSelection.svelte";
 	import {
 		clearHighlightingCaches,
 		type ContentSection,
@@ -27,6 +27,8 @@
 		inlineUnifiedDiffs?: boolean;
 		lineLocks?: LineLock[];
 		onLineClick?: (params: LineSelectionParams) => void;
+		onLineDragEnd?: (params: LineDragEndParams) => void;
+		annotHighlightRange?: { oldRange?: { startLine: number; endLine: number }; newRange?: { startLine: number; endLine: number } };
 		numberHeaderWidth?: number;
 		staged?: boolean;
 		stagedLines?: LineId[];
@@ -42,6 +44,8 @@
 		selectable: isSelectable,
 		content,
 		onLineClick,
+		onLineDragEnd,
+		annotHighlightRange,
 		wrapText = true,
 		diffFont,
 		tabSize = 4,
@@ -109,6 +113,7 @@
 
 	$effect(() => lineSelection.setRows(renderRows));
 	$effect(() => lineSelection.setOnLineClick(onLineClick));
+	$effect(() => lineSelection.setOnDragEnd(onLineDragEnd));
 
 	function getStageState(row: Row): boolean | undefined {
 		if (staged === undefined) return undefined;
@@ -160,12 +165,12 @@
 	</tbody>
 {/if}
 
-{#each renderChunks as chunkRows}
+{#each renderChunks as chunkRows, chunkIdx}
 	<tbody>
 		{#each chunkRows as row, idx (lineIdKey( { oldLine: row.beforeLineNumber, newLine: row.afterLineNumber }, ))}
 			<HunkDiffRow
 				{minWidth}
-				{idx}
+				idx={chunkIdx * 10 + idx}
 				{row}
 				{clickable}
 				{lineSelection}
@@ -178,6 +183,7 @@
 				{handleLineContextMenu}
 				{lockWarning}
 				hunkHasLocks={lineLocks && lineLocks.length > 0}
+				{annotHighlightRange}
 			/>
 		{/each}
 	</tbody>

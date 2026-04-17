@@ -1,9 +1,12 @@
 <script lang="ts">
+	import AnnotationBadge from "$components/diff/AnnotationBadge.svelte";
+	import AnnotationEditor from "$components/diff/AnnotationEditor.svelte";
 	import HiddenDiffNotice from "$components/diff/HiddenDiffNotice.svelte";
 	import HunkContextMenu from "$components/diff/HunkContextMenu.svelte";
 	import ImageDiff from "$components/diff/ImageDiff.svelte";
 	import LineLocksWarning from "$components/diff/LineLocksWarning.svelte";
 	import ReduxResult from "$components/shared/ReduxResult.svelte";
+	import { ANNOTATION_SERVICE, type AnnotationContext, type DiffLine } from "$lib/annotations/annotationService.svelte";
 	import binarySvg from "$lib/assets/empty-state/binary.svg?raw";
 	import emptyFileSvg from "$lib/assets/empty-state/empty-file.svg?raw";
 	import tooLargeSvg from "$lib/assets/empty-state/too-large.svg?raw";
@@ -22,7 +25,7 @@
 	import { isImageFile } from "@gitbutler/shared/utils/file";
 	import { EmptyStatePlaceholder, generateHunkId, HunkDiff, TestId } from "@gitbutler/ui";
 	import { DRAG_STATE_SERVICE } from "@gitbutler/ui/drag/dragStateService.svelte";
-	import { parseHunk } from "@gitbutler/ui/utils/diffParsing";
+	import { parseHunk, SectionType } from "@gitbutler/ui/utils/diffParsing";
 	import { untrack } from "svelte";
 	import type { FileDependencies } from "$lib/hunks/dependencies";
 	import type { UnifiedDiff } from "$lib/hunks/diff";
@@ -45,6 +48,7 @@
 		commitId?: string;
 		draggable?: boolean;
 		topPadding?: boolean;
+		annotationContext?: AnnotationContext;
 	};
 
 	const {
@@ -57,7 +61,19 @@
 		commitId,
 		draggable,
 		topPadding,
+		annotationContext,
 	}: Props = $props();
+
+	const resolvedAnnotationContext: AnnotationContext = $derived.by(() => {
+		if (annotationContext) return annotationContext;
+		if (selectionId.type === 'commit' && 'commitId' in selectionId) {
+			return { type: 'commit', commitId: selectionId.commitId };
+		}
+		if (selectionId.type === 'branch' && 'branchName' in selectionId) {
+			return { type: 'branch', branchName: selectionId.branchName };
+		}
+		return { type: 'worktree' };
+	});
 
 	const uiState = inject(UI_STATE);
 	const dropzoneRegistry = inject(DROPZONE_REGISTRY);
@@ -85,6 +101,56 @@
 	);
 
 	const userSettings = inject(SETTINGS);
+	const annotationService = inject(ANNOTATION_SERVICE);
+
+	interface AnnotationEdit {
+		filePath: string;
+		oldRange: { startLine: number; endLine: number } | undefined;
+		newRange: { startLine: number; endLine: number } | undefined;
+		diffLines: DiffLine[];
+	}
+
+	let editingAnnotation = $state<AnnotationEdit | null>(null);
+
+	function stripHtml(html: string): string {
+		return html.replace(/<[^>]*>/g, '')
+			.replace(/&lt;/g, '<')
+			.replace(/&gt;/g, '>')
+			.replace(/&amp;/g, '&')
+			.replace(/&quot;/g, '"')
+			.replace(/&#39;/g, "'");
+	}
+
+	function handleAnnotateDrag(
+		filePath: string,
+		oldRange: { startLine: number; endLine: number } | undefined,
+		newRange: { startLine: number; endLine: number } | undefined,
+		diffLines: DiffLine[],
+	) {
+		editingAnnotation = { filePath, oldRange, newRange, diffLines };
+	}
+
+	const fileAnnotations = $derived(annotationService.getForFile(resolvedAnnotationContext, change.path));
+
+	function rangeOverlapsHunk(range: { startLine: number; endLine: number } | undefined, hunkStart: number, hunkLines: number): boolean {
+		if (!range) return false;
+		return range.startLine < hunkStart + hunkLines && range.endLine >= hunkStart;
+	}
+
+	function annotationsForHunk(hunk: DiffHunk): typeof fileAnnotations {
+		return fileAnnotations.filter((a) =>
+			rangeOverlapsHunk(a.oldRange, hunk.oldStart, hunk.oldLines) ||
+			rangeOverlapsHunk(a.newRange, hunk.newStart, hunk.newLines)
+		);
+	}
+
+	function isEditorForHunk(hunk: DiffHunk): boolean {
+		if (!editingAnnotation || editingAnnotation.filePath !== change.path) return false;
+		return rangeOverlapsHunk(editingAnnotation.oldRange, hunk.oldStart, hunk.oldLines) ||
+			rangeOverlapsHunk(editingAnnotation.newRange, hunk.newStart, hunk.newLines);
+	}
+
+
 
 	const assignments = $derived(uncommittedService.assignmentsByPath(stackId || null, change.path));
 
@@ -232,7 +298,7 @@
 		class="diff-section"
 		class:top-padding={topPadding}
 		bind:this={viewport}
-	>
+		>
 		{#if $userSettings.svgAsImage && change.path.toLowerCase().endsWith(".svg")}
 			<ImageDiff {projectId} {change} {commitId} />
 		{:else if diff === null}
@@ -292,7 +358,7 @@
 							colorBlindFriendly={$userSettings.colorBlindFriendly}
 							inlineUnifiedDiffs={$userSettings.inlineUnifiedDiffs}
 							selectable={isUncommittedChange}
-							onLineClick={(p) => {
+							onLineClick={isUncommittedChange ? (p) => {
 								if (!canBePartiallySelected(diff.subject)) {
 									uncommittedService.checkHunk(stackId || null, change.path, hunk);
 								}
@@ -327,7 +393,7 @@
 										allLines,
 									);
 								}
-							}}
+							} : undefined}
 							onChangeStage={(selected) => {
 								if (!selectable) return;
 								if (selected) {
@@ -336,6 +402,20 @@
 									uncommittedService.uncheckHunk(stackId || null, change.path, hunk);
 								}
 							}}
+							onLineDragEnd={!isCommitting ? (params) => {
+								const diffLines: DiffLine[] = [];
+								if (params.rows) {
+									const selected = params.rows.slice(params.startIdx, params.endIdx + 1);
+									for (const row of selected) {
+										const content = stripHtml(row.tokens.join(''));
+										const prefix = row.type === SectionType.AddedLines ? '+'
+											: row.type === SectionType.RemovedLines ? '-' : ' ';
+										diffLines.push({ prefix, content });
+									}
+								}
+								handleAnnotateDrag(change.path, params.oldRange, params.newRange, diffLines);
+							} : undefined}
+							annotHighlightRange={editingAnnotation && editingAnnotation.filePath === change.path ? { oldRange: editingAnnotation.oldRange, newRange: editingAnnotation.newRange } : undefined}
 							handleLineContextMenu={(params) => {
 								contextMenu?.open(params.event || params.target, {
 									hunk,
@@ -360,6 +440,22 @@
 									</span>
 								{/each}
 							</div>
+						{/if}
+						{#each annotationsForHunk(hunk) as annotation (`${annotation.oldRange?.startLine}:${annotation.oldRange?.endLine}:${annotation.newRange?.startLine}:${annotation.newRange?.endLine}`)}
+							<AnnotationBadge
+								{annotation}
+								onEditClick={() => { editingAnnotation = { filePath: change.path, oldRange: annotation.oldRange, newRange: annotation.newRange, diffLines: annotation.diffLines }; }}
+							/>
+						{/each}
+						{#if isEditorForHunk(hunk)}
+							<AnnotationEditor
+								filePath={change.path}
+								oldRange={editingAnnotation?.oldRange}
+								newRange={editingAnnotation?.newRange}
+								diffLines={editingAnnotation?.diffLines ?? []}
+								annotationContext={resolvedAnnotationContext}
+								onclose={() => { editingAnnotation = null; }}
+							/>
 						{/if}
 					</div>
 				{:else}
@@ -403,7 +499,7 @@
 				</div>
 			{/if}
 		{/if}
-		<!-- The context menu should be outside the each block. -->
+<!-- The context menu should be outside the each block. -->
 		<HunkContextMenu
 			bind:this={contextMenu}
 			trigger={viewport}
@@ -414,6 +510,7 @@
 			{selectAllHunkLines}
 			{unselectAllHunkLines}
 			{invertHunkSelection}
+			onAnnotateLine={handleAnnotateDrag}
 		/>
 	</div>
 {/snippet}
@@ -439,6 +536,7 @@
 	.hunk-content {
 		user-select: text;
 	}
+
 	.hunk-reactions {
 		display: flex;
 		align-items: center;
