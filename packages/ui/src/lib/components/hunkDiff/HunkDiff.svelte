@@ -1,6 +1,7 @@
 <script lang="ts" module>
-	import { type LineSelectionParams } from "$components/hunkDiff/lineSelection.svelte";
+	import { type LineSelectionParams, type LineDragEndParams } from "$components/hunkDiff/lineSelection.svelte";
 	export type LineClickParams = LineSelectionParams;
+	export type { LineDragEndParams };
 </script>
 
 <script lang="ts">
@@ -36,6 +37,8 @@
 		draggingDisabled?: boolean;
 		onChangeStage?: (staged: boolean) => void;
 		onLineClick?: (params: LineSelectionParams) => void;
+		onLineDragEnd?: (params: LineDragEndParams) => void;
+		annotHighlightRange?: { oldRange?: { startLine: number; endLine: number }; newRange?: { startLine: number; endLine: number } };
 		handleLineContextMenu?: (params: ContextMenuParams) => void;
 		lockWarning?: Snippet<[DependencyLock[]]>;
 	}
@@ -58,6 +61,8 @@
 		lineLocks,
 		onChangeStage,
 		onLineClick,
+		onLineDragEnd,
+		annotHighlightRange,
 		handleLineContextMenu,
 		draggingDisabled,
 		lockWarning,
@@ -186,6 +191,8 @@
 					{selectable}
 					content={hunk.contentSections}
 					{onLineClick}
+					{onLineDragEnd}
+					{annotHighlightRange}
 					{wrapText}
 					{tabSize}
 					{diffFont}

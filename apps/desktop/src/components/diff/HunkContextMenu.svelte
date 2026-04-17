@@ -14,6 +14,8 @@
 
 <script lang="ts">
 	import IrcSendToSubmenus from "$components/diff/IrcSendToSubmenus.svelte";
+	import { ANNOTATION_SERVICE } from "$lib/annotations/annotationService.svelte";
+	import { BACKEND } from "$lib/backend";
 	import { getEditorUri, URL_SERVICE } from "$lib/backend/url";
 	import { isDiffHunk, lineIdsToHunkHeaders } from "$lib/hunks/hunk";
 	import { IRC_API_SERVICE } from "$lib/irc/ircApiService";
@@ -35,6 +37,7 @@
 		selectAllHunkLines: (hunk: DiffHunk) => void;
 		unselectAllHunkLines: (hunk: DiffHunk) => void;
 		invertHunkSelection: (hunk: DiffHunk) => void;
+		onAnnotateLine?: (filePath: string, oldRange: { startLine: number; endLine: number } | undefined, newRange: { startLine: number; endLine: number } | undefined, diffLines: import('$lib/annotations/annotationService.svelte').DiffLine[]) => void;
 	}
 
 	const {
@@ -46,11 +49,14 @@
 		selectAllHunkLines,
 		unselectAllHunkLines,
 		invertHunkSelection,
+		onAnnotateLine,
 	}: Props = $props();
 
 	const stackService = inject(STACK_SERVICE);
 	const ircApiService = inject(IRC_API_SERVICE);
 	const projectService = inject(PROJECTS_SERVICE);
+	const annotationService = inject(ANNOTATION_SERVICE);
+	const backend = inject(BACKEND);
 	const urlService = inject(URL_SERVICE);
 
 	const userSettings = inject(SETTINGS);
@@ -165,7 +171,6 @@
 					onclick={async () => {
 						const project = await projectService.fetchProject(projectId);
 						if (project?.path) {
-							// Use specific line number if available, otherwise use hunk start line
 							const lineNumber =
 								item.beforeLineNumber ?? item.afterLineNumber ?? item.hunk.newStart;
 							const path = getEditorUri({
@@ -176,6 +181,32 @@
 							urlService.openExternalUrl(path);
 						}
 						menuOpen = false;
+					}}
+				/>
+				<ContextMenuItem
+					label="Open in Xcode"
+					icon="open-in-ide"
+					onclick={async () => {
+						const project = await projectService.fetchProject(projectId);
+						if (project?.path) {
+							await backend.invoke("open_in_xcode", { path: project.path, line: null });
+						}
+						contextMenu?.close();
+					}}
+				/>
+			</ContextMenuSection>
+
+			<ContextMenuSection>
+				{@const oldLine = item.beforeLineNumber}
+				{@const newLine = item.afterLineNumber}
+				<ContextMenuItem
+					label="Add comment"
+					icon="edit"
+					onclick={() => {
+						const oldRange = oldLine !== undefined ? { startLine: oldLine, endLine: oldLine } : undefined;
+						const newRange = newLine !== undefined ? { startLine: newLine, endLine: newLine } : undefined;
+						onAnnotateLine?.(filePath, oldRange, newRange, []);
+						contextMenu?.close();
 					}}
 				/>
 			</ContextMenuSection>

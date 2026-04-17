@@ -101,6 +101,30 @@ pub fn open_url(url: String) -> Result<()> {
     open_that(&url)
 }
 
+/// Opens a project or file in Xcode using the `xed` command-line tool.
+///
+/// When `project_path` is provided, opens the Xcode project/workspace at that
+/// directory. If `file_path` is also provided, opens that file within the project.
+///
+/// # Parameters
+/// - `path`: The path to open (project directory or file).
+/// - `line`: Optional line number to jump to (only used with files).
+#[but_api]
+#[instrument(err(Debug))]
+pub fn open_in_xcode(path: String, line: Option<u32>) -> Result<()> {
+    use std::process::Command;
+
+    let mut cmd = Command::new("xed");
+    if let Some(line) = line {
+        cmd.arg("--line").arg(line.to_string());
+    }
+    cmd.arg(&path);
+
+    cmd.status()
+        .with_context(|| format!("Failed to open '{path}' in Xcode. Is Xcode installed?"))?;
+    Ok(())
+}
+
 /// Opens a terminal application at the specified directory path.
 ///
 /// # Parameters
