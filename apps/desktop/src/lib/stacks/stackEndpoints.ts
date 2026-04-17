@@ -930,7 +930,11 @@ export function buildStackEndpoints(build: BackendEndpointBuilder) {
 				actionName: "Create Virtual Branch From Branch",
 			},
 			query: (args) => args,
-			invalidatesTags: [invalidatesList(ReduxTag.HeadSha), invalidatesList(ReduxTag.BranchListing)],
+			invalidatesTags: [
+				invalidatesList(ReduxTag.HeadSha),
+				invalidatesList(ReduxTag.BranchListing),
+				invalidatesList(ReduxTag.Stacks),
+			],
 		}),
 		deleteLocalBranch: build.mutation<
 			void,
