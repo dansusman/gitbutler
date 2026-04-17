@@ -349,10 +349,26 @@ pub fn stack_details_v3(
                     .with_context(|| {
                         format!("Couldn't find any refs for stack {stack_id} in the repository")
                     })?;
-                let ref_info = ref_info(existing_ref, meta, ref_info_options)?;
-                stack_by_id(ref_info, stack_id).with_context(|| {
-                    format!("Really couldn't find {stack_id} in the current workspace projection")
-                })?
+                let existing_ref_name = existing_ref.name().to_owned();
+                let mut info = ref_info(existing_ref, meta, ref_info_options)?;
+                // First try matching by ID. If the projection is ad-hoc (e.g. traversing
+                // from an unapplied branch), the stack may have been assigned a synthetic
+                // ID (`single_branch_id`) instead of the real one from metadata. In that
+                // case, fall back to finding the stack that contains the ref we traversed
+                // from, since we know it must belong to this stack.
+                if let Some(pos) = info.stacks.iter().position(|stack| stack.id == Some(stack_id)) {
+                    info.stacks.swap_remove(pos)
+                } else {
+                    let pos = info.stacks.iter().position(|stack| {
+                        stack.segments.iter().any(|segment| {
+                            segment.ref_info.as_ref().map(|ri| ri.ref_name.as_ref())
+                                == Some(existing_ref_name.as_ref())
+                        })
+                    }).with_context(|| {
+                        format!("Really couldn't find {stack_id} in the current workspace projection")
+                    })?;
+                    info.stacks.swap_remove(pos)
+                }
             }
         }
     };
