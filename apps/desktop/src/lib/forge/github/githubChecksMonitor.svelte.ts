@@ -46,7 +46,23 @@ function parseChecks(data: ChecksResult): ChecksStatus | null {
 	// If there are no checks then there is no status to report
 	if (!hasChecks(data)) return null;
 
-	const checkRuns = data.check_runs;
+	// Deduplicate check runs by name, keeping only the most recently started run.
+	// GitHub returns runs from multiple check suites (e.g. after re-runs or new pushes),
+	// so older failed runs can linger alongside newer successful ones.
+	const latestByName = new Map<string, (typeof data.check_runs)[number]>();
+	for (const run of data.check_runs) {
+		const existing = latestByName.get(run.name);
+		if (!existing) {
+			latestByName.set(run.name, run);
+		} else {
+			const runStart = run.started_at ? new Date(run.started_at).getTime() : 0;
+			const existingStart = existing.started_at ? new Date(existing.started_at).getTime() : 0;
+			if (runStart > existingStart) {
+				latestByName.set(run.name, run);
+			}
+		}
+	}
+	const checkRuns = [...latestByName.values()];
 
 	// Establish when the first check started running, useful for showing
 	// how long something has been running.
