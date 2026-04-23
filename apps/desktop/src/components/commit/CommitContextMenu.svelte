@@ -292,6 +292,7 @@
 								if (project?.path) {
 									await backend.invoke("open_in_xcode", { projectPath: project.path, filePath: null, line: null });
 								}
+								chipToasts.success("Opened in Xcode");
 							} catch {
 								chipToasts.error("Failed to open in Xcode");
 							}

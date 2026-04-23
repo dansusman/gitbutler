@@ -24,7 +24,7 @@
 	import { SETTINGS } from "$lib/settings/userSettings";
 	import { STACK_SERVICE } from "$lib/stacks/stackService.svelte";
 	import { inject } from "@gitbutler/core/context";
-	import { ContextMenu, ContextMenuItem, ContextMenuSection, TestId } from "@gitbutler/ui";
+	import { ContextMenu, ContextMenuItem, ContextMenuSection, TestId, chipToasts } from "@gitbutler/ui";
 	import type { TreeChange } from "@gitbutler/but-sdk";
 	import type { LineId } from "@gitbutler/ui/utils/diffParsing";
 
@@ -187,11 +187,17 @@
 					label="Open in Xcode"
 					icon="open-in-ide"
 					onclick={async () => {
-						const project = await projectService.fetchProject(projectId);
-						if (project?.path) {
-							await backend.invoke("open_in_xcode", { projectPath: project.path, filePath, line: lineNumber ?? null });
+						try {
+							const project = await projectService.fetchProject(projectId);
+							if (project?.path) {
+								const lineNumber = item.beforeLineNumber ?? item.afterLineNumber ?? item.hunk.newStart;
+								await backend.invoke("open_in_xcode", { projectPath: project.path, filePath, line: lineNumber ?? null });
+							}
+							chipToasts.success("Opened in Xcode");
+						} catch {
+							chipToasts.error("Failed to open in Xcode");
 						}
-						contextMenu?.close();
+						menuOpen = false;
 					}}
 				/>
 			</ContextMenuSection>

@@ -103,11 +103,13 @@ pub fn open_url(url: String) -> Result<()> {
 
 /// Opens a project or file in Xcode using the `xed` command-line tool.
 ///
-/// When `project_path` is provided, opens the Xcode project/workspace at that
-/// directory. If `file_path` is also provided, opens that file within the project.
+/// When only `project_path` is provided, opens the Xcode project/workspace.
+/// If `file_path` is also provided, uses `xed --project` to open the file
+/// within the project window (not a separate standalone window).
 ///
 /// # Parameters
-/// - `path`: The path to open (project directory or file).
+/// - `project_path`: The root directory of the project.
+/// - `file_path`: Optional relative path to a file within the project.
 /// - `line`: Optional line number to jump to (only used with files).
 #[but_api]
 #[instrument(err(Debug))]
@@ -118,33 +120,38 @@ pub fn open_in_xcode(
 ) -> Result<()> {
     use std::process::Command;
 
-    // First, open the project/workspace so Xcode has full context.
     let project_target = resolve_xcode_project_path(&project_path);
     let project_arg = project_target.as_deref().unwrap_or(&project_path);
 
-    Command::new("xed")
-        .arg(project_arg)
-        .status()
-        .with_context(|| {
-            format!("Failed to open '{project_arg}' in Xcode. Is Xcode installed?")
-        })?;
+    match file_path {
+        Some(ref file) => {
+            let full_path = std::path::Path::new(&project_path).join(file);
+            let full_path_str = full_path.to_string_lossy();
 
-    // Then, if a specific file was requested, open it so Xcode navigates to it.
-    if let Some(ref file) = file_path {
-        let full_path = std::path::Path::new(&project_path).join(file);
-        let full_path_str = full_path.to_string_lossy();
+            // Use `xed --project <workspace> [--line N] <file>` to open the file
+            // within the project window. The --project flag tells xed to first
+            // open the workspace/project, then open the file inside it — all in
+            // a single atomic operation that avoids race conditions and prevents
+            // the file from opening in a separate standalone window.
+            let mut cmd = Command::new("xed");
+            cmd.arg("--project").arg(project_arg);
+            if let Some(line) = line {
+                cmd.arg("--line").arg(line.to_string());
+            }
+            cmd.arg(full_path_str.as_ref());
 
-        // Small delay to let Xcode process the project open.
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        let mut cmd = Command::new("xed");
-        if let Some(line) = line {
-            cmd.arg("--line").arg(line.to_string());
+            cmd.status().with_context(|| {
+                format!("Failed to open '{full_path_str}' in Xcode. Is Xcode installed?")
+            })?;
         }
-        cmd.arg(full_path_str.as_ref());
-
-        cmd.status()
-            .with_context(|| format!("Failed to open '{full_path_str}' in Xcode."))?;
+        None => {
+            Command::new("xed")
+                .arg(project_arg)
+                .status()
+                .with_context(|| {
+                    format!("Failed to open '{project_arg}' in Xcode. Is Xcode installed?")
+                })?;
+        }
     }
 
     Ok(())

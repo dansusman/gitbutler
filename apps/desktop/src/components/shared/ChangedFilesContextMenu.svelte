@@ -499,7 +499,8 @@
 										await backend.invoke("open_in_xcode", { projectPath, filePath: fp, line: null });
 									}
 								}
-								contextMenu.close();
+								chipToasts.success("Opened in Xcode");
+								menuOpen = false;
 							} catch {
 								chipToasts.error("Failed to open in Xcode");
 								console.error("Failed to open in Xcode");

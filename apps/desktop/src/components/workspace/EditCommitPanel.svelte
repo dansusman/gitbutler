@@ -331,6 +331,7 @@
 												line: null,
 											});
 										}
+										chipToasts.success("Opened in Xcode");
 									} catch {
 										chipToasts.error("Failed to open in Xcode");
 									}
