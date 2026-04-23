@@ -4,6 +4,7 @@
 	import { BRANCH_SERVICE } from "$lib/branches/branchService.svelte";
 	import { DEFAULT_FORGE_FACTORY } from "$lib/forge/forgeFactory.svelte";
 	import { inject } from "@gitbutler/core/context";
+	import { invalidatesList, ReduxTag } from "$lib/state/tags";
 	import { Button, TimeAgo, Icon, TestId } from "@gitbutler/ui";
 
 	interface Props {
@@ -42,6 +43,10 @@
 		loading = true;
 		try {
 			await baseBranchService.fetchFromRemotes(projectId, "modal");
+			forge.invalidate([
+				invalidatesList(ReduxTag.PullRequests),
+				invalidatesList(ReduxTag.Checks),
+			]);
 			await Promise.all([
 				listingService?.refresh(projectId),
 				baseBranch.result?.refetch(),
