@@ -3,6 +3,7 @@
 	import ChangedFilesContextMenu from "$components/shared/ChangedFilesContextMenu.svelte";
 	import ReduxResult from "$components/shared/ReduxResult.svelte";
 	import EditModeFileListItem from "$components/workspace/EditModeFileListItem.svelte";
+	import { BACKEND } from "$lib/backend";
 	import { getEditorUri, URL_SERVICE } from "$lib/backend/url";
 	import { splitMessage } from "$lib/commits/commitMessage";
 	import { hasUnresolvedConflictsOnDisk } from "$lib/files/conflictCheck";
@@ -18,7 +19,7 @@
 	import { USER } from "$lib/user/user";
 	import { inject } from "@gitbutler/core/context";
 
-	import { AsyncButton, Avatar, Badge, Button, InfoButton, Modal, TestId } from "@gitbutler/ui";
+	import { AsyncButton, Avatar, Badge, Button, InfoButton, Modal, TestId, chipToasts } from "@gitbutler/ui";
 	import { SvelteMap, SvelteSet } from "svelte/reactivity";
 	import type { ConflictState } from "$lib/files/conflictEntryPresence";
 	import type { EditModeMetadata, TreeChange } from "@gitbutler/but-sdk";
@@ -40,6 +41,7 @@
 	const modeService = inject(MODE_SERVICE);
 	const userSettings = inject(SETTINGS);
 	const urlService = inject(URL_SERVICE);
+	const backend = inject(BACKEND);
 	const fileService = inject(FILE_SERVICE);
 
 	const initialFiles = $derived(modeService.initialEditModeState({ projectId }));
@@ -303,7 +305,7 @@
 				</p>
 
 				<div class="editmode__actions">
-					<div class="flex flex-1">
+					<div class="flex flex-1" style="gap: 8px;">
 						{#if conflictedFiles.length > 0}
 							<Button
 								kind="outline"
@@ -314,7 +316,30 @@
 									? "Open the conflicted file in your editor"
 									: "Open all files with conflicts in your editor"}
 							>
-								Open conflicted files
+								Open in editor
+							</Button>
+							<Button
+								kind="outline"
+								icon="open-in-ide"
+								reversedDirection
+								onclick={async () => {
+									try {
+										for (const file of conflictedFiles) {
+											await backend.invoke("open_in_xcode", {
+												projectPath: project.path,
+												filePath: file.path,
+												line: null,
+											});
+										}
+									} catch {
+										chipToasts.error("Failed to open in Xcode");
+									}
+								}}
+								tooltip={conflictedFiles.length === 1
+									? "Open the conflicted file in Xcode"
+									: "Open all files with conflicts in Xcode"}
+							>
+								Open in Xcode
 							</Button>
 						{/if}
 					</div>

@@ -111,18 +111,121 @@ pub fn open_url(url: String) -> Result<()> {
 /// - `line`: Optional line number to jump to (only used with files).
 #[but_api]
 #[instrument(err(Debug))]
-pub fn open_in_xcode(path: String, line: Option<u32>) -> Result<()> {
+pub fn open_in_xcode(
+    project_path: String,
+    file_path: Option<String>,
+    line: Option<u32>,
+) -> Result<()> {
     use std::process::Command;
 
-    let mut cmd = Command::new("xed");
-    if let Some(line) = line {
-        cmd.arg("--line").arg(line.to_string());
-    }
-    cmd.arg(&path);
+    // First, open the project/workspace so Xcode has full context.
+    let project_target = resolve_xcode_project_path(&project_path);
+    let project_arg = project_target.as_deref().unwrap_or(&project_path);
 
-    cmd.status()
-        .with_context(|| format!("Failed to open '{path}' in Xcode. Is Xcode installed?"))?;
+    Command::new("xed")
+        .arg(project_arg)
+        .status()
+        .with_context(|| {
+            format!("Failed to open '{project_arg}' in Xcode. Is Xcode installed?")
+        })?;
+
+    // Then, if a specific file was requested, open it so Xcode navigates to it.
+    if let Some(ref file) = file_path {
+        let full_path = std::path::Path::new(&project_path).join(file);
+        let full_path_str = full_path.to_string_lossy();
+
+        // Small delay to let Xcode process the project open.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let mut cmd = Command::new("xed");
+        if let Some(line) = line {
+            cmd.arg("--line").arg(line.to_string());
+        }
+        cmd.arg(full_path_str.as_ref());
+
+        cmd.status()
+            .with_context(|| format!("Failed to open '{full_path_str}' in Xcode."))?;
+    }
+
     Ok(())
+}
+
+/// If the given path is a directory, search for a `.xcworkspace` or `.xcodeproj`
+/// bundle within it (up to 3 levels deep). Prefers `.xcworkspace` over `.xcodeproj`.
+/// Returns `None` if the path is a file or no Xcode project is found.
+fn resolve_xcode_project_path(path: &str) -> Option<String> {
+    use std::path::Path;
+
+    let p = Path::new(path);
+    if !p.is_dir() {
+        return None;
+    }
+
+    // If the directory itself is an xcodeproj/xcworkspace, use it directly.
+    if let Some(ext) = p.extension() {
+        let ext = ext.to_string_lossy();
+        if ext == "xcworkspace" || ext == "xcodeproj" {
+            return None; // Already correct, let xed handle it.
+        }
+    }
+
+    let mut workspaces = Vec::new();
+    let mut projects = Vec::new();
+    collect_xcode_projects(p, 0, 3, &mut workspaces, &mut projects);
+
+    // Filter out xcworkspaces that live inside xcodeproj bundles (e.g. Foo.xcodeproj/project.xcworkspace)
+    workspaces.retain(|ws| {
+        !ws.components().any(|c| {
+            c.as_os_str()
+                .to_string_lossy()
+                .ends_with(".xcodeproj")
+        })
+    });
+
+    // Prefer xcworkspace, then xcodeproj.
+    workspaces
+        .first()
+        .or(projects.first())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+fn collect_xcode_projects(
+    dir: &std::path::Path,
+    depth: usize,
+    max_depth: usize,
+    workspaces: &mut Vec<std::path::PathBuf>,
+    projects: &mut Vec<std::path::PathBuf>,
+) {
+    if depth >= max_depth {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(ext) = path.extension() {
+            let ext = ext.to_string_lossy();
+            if ext == "xcworkspace" {
+                workspaces.push(path.clone());
+                continue;
+            }
+            if ext == "xcodeproj" {
+                projects.push(path.clone());
+                continue;
+            }
+        }
+        // Skip hidden dirs and common non-project dirs
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "node_modules" || name == "Pods" || name == "build" || name == "target" {
+            continue;
+        }
+        collect_xcode_projects(&path, depth + 1, max_depth, workspaces, projects);
+    }
 }
 
 /// Opens a terminal application at the specified directory path.

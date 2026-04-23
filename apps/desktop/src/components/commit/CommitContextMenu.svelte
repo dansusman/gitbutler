@@ -290,7 +290,7 @@
 							try {
 								const project = await projectsService.fetchProject(projectId);
 								if (project?.path) {
-									await backend.invoke("open_in_xcode", { path: project.path, line: null });
+									await backend.invoke("open_in_xcode", { projectPath: project.path, filePath: null, line: null });
 								}
 							} catch {
 								chipToasts.error("Failed to open in Xcode");

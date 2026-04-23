@@ -494,7 +494,10 @@
 								const project = await projectService.fetchProject(projectId);
 								const projectPath = project?.path;
 								if (projectPath) {
-									await backend.invoke("open_in_xcode", { path: projectPath, line: null });
+									const filePaths = item.changes.map((c) => c.path);
+									for (const fp of filePaths) {
+										await backend.invoke("open_in_xcode", { projectPath, filePath: fp, line: null });
+									}
 								}
 								contextMenu.close();
 							} catch {

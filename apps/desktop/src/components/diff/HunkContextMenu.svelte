@@ -189,7 +189,7 @@
 					onclick={async () => {
 						const project = await projectService.fetchProject(projectId);
 						if (project?.path) {
-							await backend.invoke("open_in_xcode", { path: project.path, line: null });
+							await backend.invoke("open_in_xcode", { projectPath: project.path, filePath, line: lineNumber ?? null });
 						}
 						contextMenu?.close();
 					}}
