@@ -11,10 +11,13 @@ import type {
 	HunkAssignment,
 	HunkAssignmentRequest,
 	HunkDependencies,
+	HunkHeader,
 	IgnoredWorktreeChange,
 	TreeChange,
 	WorktreeChanges,
 } from "@gitbutler/but-sdk";
+
+export type RowRange = { start: number; end: number };
 
 export function buildWorktreeEndpoints(build: BackendEndpointBuilder) {
 	return {
@@ -97,6 +100,22 @@ export function buildWorktreeEndpoints(build: BackendEndpointBuilder) {
 			extraOptions: {
 				command: "assign_hunk",
 			},
+			query: (args) => args,
+			invalidatesTags: [invalidatesList(ReduxTag.WorktreeChanges)],
+		}),
+		splitHunk: build.mutation<
+			void,
+			{ projectId: string; path: number[]; anchor: HunkHeader; ranges: RowRange[] }
+		>({
+			extraOptions: { command: "split_hunk" },
+			query: (args) => args,
+			invalidatesTags: [invalidatesList(ReduxTag.WorktreeChanges)],
+		}),
+		unsplitHunk: build.mutation<
+			void,
+			{ projectId: string; path: number[]; anchor: HunkHeader }
+		>({
+			extraOptions: { command: "unsplit_hunk" },
 			query: (args) => args,
 			invalidatesTags: [invalidatesList(ReduxTag.WorktreeChanges)],
 		}),

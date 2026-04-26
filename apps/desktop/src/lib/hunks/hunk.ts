@@ -320,28 +320,47 @@ function rowBelongsToHeader(
 }
 
 /**
+ * Output of [`splitDiffHunkByHeaders`].
+ *
+ * `anchor` is set when `hunk` is a sub-hunk — the backend split a single
+ * natural hunk into multiple pieces. It points at the natural anchor so the
+ * caller can render an "un-split" affordance and call `unsplit_hunk` with
+ * the right key. `anchor` is `undefined` for natural hunks that pass
+ * through unchanged.
+ */
+export type SplitDiffHunk = {
+	hunk: DiffHunk;
+	anchor?: HunkHeader;
+};
+
+/**
  * If `subHeaders` describes one or more sub-hunks of `natural` (the
  * materialized output of a `split_hunk` operation on the backend),
  * partition `natural`'s body rows among the sub-hunks and return one
  * synthetic `DiffHunk` per sub-hunk. Each synthetic hunk reuses the
  * row content of `natural` verbatim, just regrouped under its own
- * `@@` header.
+ * `@@` header. Returned items carry an `anchor` pointing at `natural`
+ * so callers can offer an un-split UI affordance.
  *
  * If `subHeaders` is empty or contains a single header equal to
- * `natural`, returns `[natural]` unchanged.
+ * `natural`, returns `[{ hunk: natural }]` unchanged (no anchor).
  *
  * Headers that don't fit within `natural` are ignored. Rows that don't
  * belong to any header (which shouldn't happen for valid backend output
  * since residuals are always emitted) are dropped silently.
  */
-export function splitDiffHunkByHeaders(natural: DiffHunk, subHeaders: HunkHeader[]): DiffHunk[] {
-	if (subHeaders.length === 0) return [natural];
+export function splitDiffHunkByHeaders(
+	natural: DiffHunk,
+	subHeaders: HunkHeader[],
+): SplitDiffHunk[] {
+	if (subHeaders.length === 0) return [{ hunk: natural }];
 	const sorted = subHeaders
 		.filter((h) => headerWithinHunk(natural, h))
 		.slice()
 		.sort(orderHeaders);
-	if (sorted.length === 0) return [natural];
-	if (sorted.length === 1 && hunkHeaderEquals(natural, sorted[0]!)) return [natural];
+	if (sorted.length === 0) return [{ hunk: natural }];
+	if (sorted.length === 1 && hunkHeaderEquals(natural, sorted[0]!))
+		return [{ hunk: natural }];
 
 	const lines = natural.diff.split("\n");
 	// Trailing newline produces an empty final element after split; preserve it.
@@ -381,16 +400,25 @@ export function splitDiffHunkByHeaders(natural: DiffHunk, subHeaders: HunkHeader
 		if (kind === " " || kind === "+") newLine++;
 	}
 
+	const anchor: HunkHeader = {
+		oldStart: natural.oldStart,
+		oldLines: natural.oldLines,
+		newStart: natural.newStart,
+		newLines: natural.newLines,
+	};
 	return sorted.map((header, bi) => {
 		const body = buckets[bi]!;
 		const headerLine = renderHunkHeaderLine(header);
 		const diff = [headerLine, ...body, ...(hasTrailingNewline ? [""] : [])].join("\n");
 		return {
-			oldStart: header.oldStart,
-			oldLines: header.oldLines,
-			newStart: header.newStart,
-			newLines: header.newLines,
-			diff,
+			hunk: {
+				oldStart: header.oldStart,
+				oldLines: header.oldLines,
+				newStart: header.newStart,
+				newLines: header.newLines,
+				diff,
+			},
+			anchor,
 		};
 	});
 }

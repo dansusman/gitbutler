@@ -11,6 +11,7 @@
 	import emptyFileSvg from "$lib/assets/empty-state/empty-file.svg?raw";
 	import tooLargeSvg from "$lib/assets/empty-state/too-large.svg?raw";
 	import { DEPENDENCY_SERVICE } from "$lib/dependencies/dependencyService.svelte";
+	import { DIFF_SERVICE } from "$lib/hunks/diffService.svelte";
 	import { draggableChips } from "$lib/dragging/draggable";
 	import { HunkDropDataV3 } from "$lib/dragging/draggables";
 	import { DROPZONE_REGISTRY } from "$lib/dragging/registry";
@@ -19,6 +20,7 @@
 		getLineLocks,
 		hunkHeaderEquals,
 		splitDiffHunkByHeaders,
+		type SplitDiffHunk,
 	} from "$lib/hunks/hunk";
 	import { IRC_API_SERVICE } from "$lib/irc/ircApiService";
 	import { type SelectionId } from "$lib/selection/key";
@@ -98,6 +100,57 @@
 
 	const uncommittedService = inject(UNCOMMITTED_SERVICE);
 	const dependencyService = inject(DEPENDENCY_SERVICE);
+	const diffService = inject(DIFF_SERVICE);
+
+	function pathToBytes(p: string): number[] {
+		return Array.from(new TextEncoder().encode(p));
+	}
+
+	/**
+	 * Returns true if any pair of sub-hunks of `anchor` is assigned to a
+	 * different branch than the others. Drives the un-split confirmation
+	 * prompt: dropping the override would lose any reassignment a sub-hunk
+	 * received via `assign_hunk` after split.
+	 */
+	function subHunksHaveDivergentAssignments(anchorHeader: {
+		oldStart: number;
+		oldLines: number;
+		newStart: number;
+		newLines: number;
+	}): boolean {
+		const contained = assignments.current.filter((a) => {
+			if (!a.hunkHeader) return false;
+			const h = a.hunkHeader;
+			return (
+				h.oldStart >= anchorHeader.oldStart &&
+				h.oldStart + h.oldLines <= anchorHeader.oldStart + anchorHeader.oldLines &&
+				h.newStart >= anchorHeader.newStart &&
+				h.newStart + h.newLines <= anchorHeader.newStart + anchorHeader.newLines
+			);
+		});
+		if (contained.length < 2) return false;
+		const keys = new Set(contained.map((a) => a.stackId ?? a.branchRefBytes ?? ""));
+		return keys.size > 1;
+	}
+
+	async function handleUnsplit(anchor: {
+		oldStart: number;
+		oldLines: number;
+		newStart: number;
+		newLines: number;
+	}) {
+		if (subHunksHaveDivergentAssignments(anchor)) {
+			const confirmed = window.confirm(
+				"Un-split will discard the per-line stack reassignments for this hunk. Continue?",
+			);
+			if (!confirmed) return;
+		}
+		await diffService.unsplitHunk({
+			projectId,
+			path: pathToBytes(change.path),
+			anchor,
+		});
+	}
 
 	const fileDependenciesQuery = $derived(
 		selectionId.type === "worktree"
@@ -190,31 +243,30 @@
 		}));
 	}
 
-	function filter(hunks: DiffHunk[]): DiffHunk[] {
-		if (selectionId.type !== "worktree") return hunks;
+	function filter(hunks: DiffHunk[]): SplitDiffHunk[] {
+		if (selectionId.type !== "worktree") return hunks.map((hunk) => ({ hunk }));
 		// For each natural hunk, look at the assignments for this file and:
 		//   - if any whole-file (binary / too-large) assignment exists, keep the
 		//     natural hunk verbatim,
 		//   - else partition its rows by the assignment hunk-headers that fit
 		//     within it (the materialized output of a `split_hunk` call) and
-		//     emit one synthetic DiffHunk per sub-range,
+		//     emit one SplitDiffHunk per sub-range,
 		//   - else (no matching assignment) drop it.
-		const result: DiffHunk[] = [];
+		const result: SplitDiffHunk[] = [];
 		for (const hunk of hunks) {
 			if (assignments.current.some((a) => a?.hunkHeader === null)) {
-				result.push(hunk);
+				result.push({ hunk });
 				continue;
 			}
 			const headers = assignments.current
 				.map((a) => a.hunkHeader)
 				.filter((h): h is NonNullable<typeof h> => h !== null && h !== undefined);
 			const split = splitDiffHunkByHeaders(hunk, headers);
-			// `splitDiffHunkByHeaders` returns `[hunk]` when no headers fit, which
-			// would re-add a hunk that has no matching assignment at all. Detect
-			// that case and drop instead.
+			// `splitDiffHunkByHeaders` returns `[{ hunk }]` (no anchor) when no
+			// headers fit. Drop the hunk if it has no matching assignment at all.
 			if (
 				split.length === 1 &&
-				split[0] === hunk &&
+				split[0]!.anchor === undefined &&
 				!headers.some((h) => hunkHeaderEquals(hunk, h))
 			) {
 				continue;
@@ -224,7 +276,9 @@
 		return result;
 	}
 
-	const filteredHunks = $derived(diff?.type === "Patch" ? filter(diff.subject.hunks) : []);
+	const filteredHunks = $derived(
+		diff?.type === "Patch" ? filter(diff.subject.hunks) : ([] as SplitDiffHunk[]),
+	);
 	let renderedHunkCount = $state(INITIAL_HUNKS);
 
 	$effect(() => {
@@ -344,11 +398,12 @@
 					}}
 				/>
 			{:else}
-				{#each filteredHunks.slice(0, renderedHunkCount) as hunk, hunkIndex}
+				{#each filteredHunks.slice(0, renderedHunkCount) as { hunk, anchor: subAnchor }, hunkIndex}
 					{@const selection = uncommittedService.hunkCheckStatus(stackId, change.path, hunk)}
 					{@const [_, lineLocks] = getLineLocks(hunk, fileDependencies?.dependencies ?? [])}
 					{@const hunkId = generateHunkId(change.path, hunkIndex)}
 					{@const reactions = fileReactions[hunkKey(hunk)] ?? []}
+					{@const isSubHunk = subAnchor !== undefined}
 					<div
 						class="hunk-content"
 						use:draggableChips={{
@@ -371,6 +426,8 @@
 							id={hunkId}
 							draggingDisabled={!draggable}
 							hideCheckboxes={!isCommitting}
+							{isSubHunk}
+							onUnsplit={subAnchor ? () => handleUnsplit(subAnchor) : undefined}
 							filePath={change.path}
 							hunkStr={hunk.diff}
 							staged={selection.current.selected}

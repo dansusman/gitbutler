@@ -35,6 +35,14 @@
 		selectable?: boolean;
 		lineLocks?: LineLock[];
 		draggingDisabled?: boolean;
+		/**
+		 * When set, this hunk is a sub-hunk produced by a `split_hunk` call.
+		 * The header bar shows a "split" icon that, when clicked, invokes
+		 * `onUnsplit`. Hosts the un-split affordance per the line-by-line
+		 * commits design.
+		 */
+		isSubHunk?: boolean;
+		onUnsplit?: () => void;
 		onChangeStage?: (staged: boolean) => void;
 		onLineClick?: (params: LineSelectionParams) => void;
 		onLineDragEnd?: (params: LineDragEndParams) => void;
@@ -66,6 +74,8 @@
 		handleLineContextMenu,
 		draggingDisabled,
 		lockWarning,
+		isSubHunk = false,
+		onUnsplit,
 	}: Props = $props();
 
 	const BORDER_WIDTH = 1;
@@ -180,6 +190,20 @@
 						<span>
 							{hunkSummary}
 						</span>
+						{#if isSubHunk}
+							<button
+								type="button"
+								class="table__sub-hunk-icon"
+								title="Un-split: merge this sub-hunk back into the natural hunk"
+								aria-label="Un-split sub-hunk"
+								onclick={(e) => {
+									e.stopPropagation();
+									onUnsplit?.();
+								}}
+							>
+								<Icon name="split" />
+							</button>
+						{/if}
 					</th>
 				</tr>
 			</thead>
@@ -306,12 +330,37 @@
 		box-sizing: border-box;
 		display: flex;
 		align-items: center;
+		gap: 6px;
 		padding: 4px 6px;
 		border-bottom: 1px solid var(--border-2);
 		color: var(--diff-count-text);
 		font-size: 12px;
 		text-wrap: nowrap;
 	}
+
+	.table__sub-hunk-icon {
+		display: inline-flex;
+		flex: 0 0 auto;
+		align-items: center;
+		justify-content: center;
+		padding: 1px 3px;
+		border: none;
+		border-radius: 3px;
+		outline: none;
+		background: transparent;
+		color: var(--diff-count-text);
+		opacity: 0.7;
+		cursor: pointer;
+		transition:
+			background 0.15s,
+			opacity 0.15s;
+	}
+
+	.table__sub-hunk-icon:hover {
+		background: var(--clr-bg-2);
+		opacity: 1;
+	}
+
 
 	/* CONTRAST MODIFIERS */
 	/* Color blind-friendly overrides for medium (default) contrast */

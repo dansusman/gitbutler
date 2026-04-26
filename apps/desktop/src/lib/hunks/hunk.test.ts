@@ -1139,14 +1139,17 @@ describe.concurrent("splitDiffHunkByHeaders", () => {
 	};
 
 	test("returns natural unchanged when no headers are supplied", () => {
-		expect(splitDiffHunkByHeaders(natural, [])).toEqual([natural]);
+		const result = splitDiffHunkByHeaders(natural, []);
+		expect(result).toEqual([{ hunk: natural }]);
+		expect(result[0]!.anchor).toBeUndefined();
 	});
 
 	test("returns natural unchanged when only header equals natural", () => {
 		const result = splitDiffHunkByHeaders(natural, [
 			{ oldStart: 10, oldLines: 5, newStart: 10, newLines: 5 },
 		]);
-		expect(result).toEqual([natural]);
+		expect(result).toEqual([{ hunk: natural }]);
+		expect(result[0]!.anchor).toBeUndefined();
 	});
 
 	test("three-way split produces three sub-hunks covering all rows", () => {
@@ -1162,9 +1165,17 @@ describe.concurrent("splitDiffHunkByHeaders", () => {
 		];
 		const result = splitDiffHunkByHeaders(natural, subs);
 		expect(result).toHaveLength(3);
-		expect(result[0]!.diff).toBe("@@ -10,1 +10,1 @@\n c1\n");
-		expect(result[1]!.diff).toBe("@@ -11,1 +11,1 @@\n-r1\n+a1\n");
-		expect(result[2]!.diff).toBe("@@ -12,3 +12,3 @@\n-r2\n+a2\n c2\n");
+		expect(result[0]!.hunk.diff).toBe("@@ -10,1 +10,1 @@\n c1\n");
+		expect(result[1]!.hunk.diff).toBe("@@ -11,1 +11,1 @@\n-r1\n+a1\n");
+		expect(result[2]!.hunk.diff).toBe("@@ -12,3 +12,3 @@\n-r2\n+a2\n c2\n");
+		for (const item of result) {
+			expect(item.anchor).toEqual({
+				oldStart: 10,
+				oldLines: 5,
+				newStart: 10,
+				newLines: 5,
+			});
+		}
 	});
 
 	test("pure-add sub-hunk picks only the + row", () => {
@@ -1184,15 +1195,21 @@ describe.concurrent("splitDiffHunkByHeaders", () => {
 			{ oldStart: 1, oldLines: 0, newStart: 2, newLines: 2 },
 		]);
 		expect(result).toHaveLength(2);
-		expect(result[0]!.diff).toBe("@@ -1,0 +1,1 @@\n+a1\n");
-		expect(result[1]!.diff).toBe("@@ -1,0 +2,2 @@\n+a2\n+a3\n");
+		expect(result[0]!.hunk.diff).toBe("@@ -1,0 +1,1 @@\n+a1\n");
+		expect(result[1]!.hunk.diff).toBe("@@ -1,0 +2,2 @@\n+a2\n+a3\n");
+		expect(result[0]!.anchor).toEqual({
+			oldStart: 1,
+			oldLines: 0,
+			newStart: 1,
+			newLines: 3,
+		});
 	});
 
 	test("ignores headers that don't fit within the natural hunk", () => {
 		const result = splitDiffHunkByHeaders(natural, [
 			{ oldStart: 999, oldLines: 1, newStart: 999, newLines: 1 },
 		]);
-		expect(result).toEqual([natural]);
+		expect(result).toEqual([{ hunk: natural }]);
 	});
 
 	test("preserves '\\ No newline at end of file' markers with their row", () => {
@@ -1213,6 +1230,6 @@ describe.concurrent("splitDiffHunkByHeaders", () => {
 			{ oldStart: 2, oldLines: 1, newStart: 2, newLines: 1 },
 		]);
 		expect(result).toHaveLength(2);
-		expect(result[1]!.diff).toContain("\\ No newline at end of file");
+		expect(result[1]!.hunk.diff).toContain("\\ No newline at end of file");
 	});
 });

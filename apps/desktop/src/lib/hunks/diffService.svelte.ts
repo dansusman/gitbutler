@@ -22,6 +22,14 @@ export class DiffService {
 		return this.backendApi.endpoints.assignHunk.mutate;
 	}
 
+	get splitHunk() {
+		return this.backendApi.endpoints.splitHunk.mutate;
+	}
+
+	get unsplitHunk() {
+		return this.backendApi.endpoints.unsplitHunk.mutate;
+	}
+
 	async fetchDiff(projectId: string, change: TreeChange) {
 		const { getDiff } = this.backendApi.endpoints;
 		return await getDiff.fetch({ projectId, change });
