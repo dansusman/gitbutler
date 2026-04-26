@@ -1058,6 +1058,71 @@ pub fn upsert_override(gitdir: &Path, ov: SubHunkOverride) {
     project.insert((ov.path.clone(), ov.anchor), ov);
 }
 
+/// Look up a single override by `(gitdir, path, anchor)`. Returns a clone
+/// so callers can read without holding the store lock.
+pub fn get_override(
+    gitdir: &Path,
+    path: &BString,
+    anchor: HunkHeader,
+) -> Option<SubHunkOverride> {
+    let store = global_store().lock().expect("override store poisoned");
+    store.get(gitdir)?.get(&(path.clone(), anchor)).cloned()
+}
+
+/// Insert one or more user-selected ranges into an existing override's
+/// `ranges` partition, splitting any existing range that contains a new
+/// range at its boundaries. Used by `split_hunk` to support re-splitting
+/// an already-split sub-hunk: rather than replacing the override (which
+/// would lose the user's earlier splits), we refine the partition.
+///
+/// Inputs:
+/// - `existing`: the override's current full-coverage `ranges` slice
+///   (sorted, disjoint, including residuals).
+/// - `new_user_ranges`: sorted, disjoint, non-empty user-selected ranges,
+///   each entirely contained within `[0, row_count)` and within the
+///   coverage of `existing`. Caller is responsible for context-trimming
+///   them first.
+///
+/// Returns a new partition `ranges` with the same coverage as `existing`
+/// but with each `new_user_range` materialized as its own boundary.
+/// Output is sorted, disjoint, non-empty.
+pub fn merge_user_ranges_into_partition(
+    existing: &[RowRange],
+    new_user_ranges: &[RowRange],
+) -> Vec<RowRange> {
+    if new_user_ranges.is_empty() {
+        return existing.to_vec();
+    }
+    let mut breakpoints: Vec<u32> = Vec::new();
+    for r in existing {
+        breakpoints.push(r.start);
+        breakpoints.push(r.end);
+    }
+    for r in new_user_ranges {
+        breakpoints.push(r.start);
+        breakpoints.push(r.end);
+    }
+    breakpoints.sort();
+    breakpoints.dedup();
+
+    // Build segments between breakpoints; keep only those that fall
+    // inside an existing range (preserving original coverage).
+    let mut out: Vec<RowRange> = Vec::new();
+    for w in breakpoints.windows(2) {
+        let seg = RowRange { start: w[0], end: w[1] };
+        if seg.is_empty() {
+            continue;
+        }
+        let inside_existing = existing
+            .iter()
+            .any(|r| r.start <= seg.start && seg.end <= r.end);
+        if inside_existing {
+            out.push(seg);
+        }
+    }
+    out
+}
+
 /// Remove an override by `(path, anchor)`. Returns the removed override, if any.
 pub fn remove_override(
     gitdir: &Path,
@@ -2220,5 +2285,120 @@ mod tests {
             "old key still present in store",
         );
         clear_store_for_tests_at(Some(gitdir));
+    }
+
+    /// Re-splitting a sub-hunk: a user has split a natural hunk into
+    /// (0,5)/(5,15), then re-splits within (5,15) at row 10. The new
+    /// partition should be (0,5)/(5,10)/(10,15) — the existing range
+    /// containing the new boundary is split, the rest is preserved.
+    #[test]
+    fn merge_user_ranges_splits_at_boundary() {
+        let existing = vec![
+            RowRange { start: 0, end: 5 },
+            RowRange { start: 5, end: 15 },
+        ];
+        let new_ranges = vec![RowRange { start: 10, end: 11 }];
+        let merged = merge_user_ranges_into_partition(&existing, &new_ranges);
+        assert_eq!(
+            merged,
+            vec![
+                RowRange { start: 0, end: 5 },
+                RowRange { start: 5, end: 10 },
+                RowRange { start: 10, end: 11 },
+                RowRange { start: 11, end: 15 },
+            ],
+        );
+    }
+
+    /// Re-splitting where the new range covers more than a single point:
+    /// the existing partition is sliced into pre-overlap, overlap, and
+    /// post-overlap segments around the new range.
+    #[test]
+    fn merge_user_ranges_carves_out_a_span() {
+        let existing = vec![RowRange { start: 0, end: 20 }];
+        let new_ranges = vec![RowRange { start: 7, end: 12 }];
+        let merged = merge_user_ranges_into_partition(&existing, &new_ranges);
+        assert_eq!(
+            merged,
+            vec![
+                RowRange { start: 0, end: 7 },
+                RowRange { start: 7, end: 12 },
+                RowRange { start: 12, end: 20 },
+            ],
+        );
+    }
+
+    /// New range that exactly matches an existing range boundary is a
+    /// no-op (already represented).
+    #[test]
+    fn merge_user_ranges_no_op_when_already_aligned() {
+        let existing = vec![
+            RowRange { start: 0, end: 5 },
+            RowRange { start: 5, end: 15 },
+        ];
+        let new_ranges = vec![RowRange { start: 0, end: 5 }];
+        let merged = merge_user_ranges_into_partition(&existing, &new_ranges);
+        assert_eq!(merged, existing);
+    }
+
+    /// Empty `new_user_ranges` returns the existing partition unchanged.
+    #[test]
+    fn merge_user_ranges_empty_input_passthrough() {
+        let existing = vec![
+            RowRange { start: 0, end: 5 },
+            RowRange { start: 5, end: 15 },
+        ];
+        let merged = merge_user_ranges_into_partition(&existing, &[]);
+        assert_eq!(merged, existing);
+    }
+
+    /// Phase 6.5a (line-by-line commits): the override store needs to
+    /// be serializable so it can be persisted to disk in `but-db`.
+    /// Verifies that round-tripping a fully-populated `SubHunkOverride`
+    /// through JSON is lossless.
+    #[test]
+    fn sub_hunk_override_serde_round_trip() {
+        let kinds = parse_row_kinds(&sample_diff());
+        let user_range = RowRange { start: 1, end: 5 };
+        let ranges = materialize_residual_ranges(&[user_range], &kinds);
+        let stack_id = uuid::Uuid::new_v4();
+        let mut assignments: BTreeMap<RowRange, HunkAssignmentTarget> = BTreeMap::new();
+        assignments.insert(
+            user_range,
+            HunkAssignmentTarget::Stack {
+                stack_id: stack_id.into(),
+            },
+        );
+        let original = SubHunkOverride {
+            path: BString::from("src/foo.rs"),
+            anchor: anchor(),
+            ranges,
+            assignments,
+            rows: kinds,
+            anchor_diff: sample_diff(),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: SubHunkOverride =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.path, original.path);
+        assert_eq!(restored.anchor, original.anchor);
+        assert_eq!(restored.ranges, original.ranges);
+        assert_eq!(restored.rows.len(), original.rows.len());
+        for (a, b) in restored.rows.iter().zip(original.rows.iter()) {
+            assert_eq!(a, b);
+        }
+        assert_eq!(restored.anchor_diff, original.anchor_diff);
+        assert_eq!(restored.assignments.len(), original.assignments.len());
+        let restored_target = restored
+            .assignments
+            .get(&user_range)
+            .expect("per-range assignment preserved");
+        match (restored_target, original.assignments.get(&user_range).unwrap()) {
+            (
+                HunkAssignmentTarget::Stack { stack_id: a },
+                HunkAssignmentTarget::Stack { stack_id: b },
+            ) => assert_eq!(a, b),
+            _ => panic!("target kind drifted across round-trip"),
+        }
     }
 }

@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 
 use anyhow::{Context as _, anyhow, bail};
 use bstr::BString;
@@ -326,11 +325,6 @@ pub fn split_hunk_with_perm(
     but_hunk_assignment::sub_hunk::validate_ranges(&trimmed, row_count)
         .with_context(|| "invalid split request")?;
 
-    // Phase 4.5: store residuals as first-class ranges so they can survive
-    // partial commits via the migration pass.
-    let stored_ranges =
-        but_hunk_assignment::sub_hunk::materialize_residual_ranges(&trimmed, &kinds);
-
     // Reconstruct the anchor's full diff (header + body) so the migration
     // pass can content-match rows when the anchor's shape changes.
     let mut anchor_diff = BString::default();
@@ -343,13 +337,31 @@ pub fn split_hunk_with_perm(
     );
     anchor_diff.extend_from_slice(hunk.diff.as_ref());
 
+    // Merge with an existing override for the same `(path, anchor)` so a
+    // user can refine an already-split natural hunk by re-splitting one
+    // of its sub-hunks. Without this, calling `split_hunk` again would
+    // wipe out the previous splits.
+    let existing = but_hunk_assignment::get_override(&gitdir, &path, anchor);
+    let merged_assignments = existing
+        .as_ref()
+        .map(|ov| ov.assignments.clone())
+        .unwrap_or_default();
+    let stored_ranges = match existing.as_ref() {
+        Some(ov) => but_hunk_assignment::merge_user_ranges_into_partition(&ov.ranges, &trimmed),
+        None => {
+            // Phase 4.5: store residuals as first-class ranges so they can survive
+            // partial commits via the migration pass.
+            but_hunk_assignment::sub_hunk::materialize_residual_ranges(&trimmed, &kinds)
+        }
+    };
+
     but_hunk_assignment::upsert_override(
         &gitdir,
         SubHunkOverride {
             path: path.clone(),
             anchor,
             ranges: stored_ranges,
-            assignments: BTreeMap::new(),
+            assignments: merged_assignments,
             rows: kinds,
             anchor_diff,
         },

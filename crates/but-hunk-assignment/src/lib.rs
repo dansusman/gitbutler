@@ -15,7 +15,8 @@ pub mod sub_hunk;
 
 pub use sub_hunk::{
     RowRange, SubHunkOrigin, SubHunkOverride, drop_overrides, encode_sub_hunk_for_commit,
-    list_overrides, reconcile_with_overrides, remove_override, upsert_override,
+    get_override, list_overrides, merge_user_ranges_into_partition,
+    reconcile_with_overrides, remove_override, upsert_override,
 };
 
 use std::collections::{BTreeMap, HashMap};
