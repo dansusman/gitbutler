@@ -1470,60 +1470,85 @@ pub fn drop_overrides_persistent(
 /// the reconcile pass drops or migrates. Use this from any path that
 /// already has a `&mut DbHandle`; the in-memory-only variant is preserved
 /// for callers that don't.
+///
+/// Compares the **disk** state to the **post-reconcile in-memory** state,
+/// not memory-before to memory-after, so that drift introduced by an
+/// earlier non-persistent reconcile (e.g. the watcher path that calls
+/// `assignments_with_fallback`) gets caught and corrected. Without that,
+/// the in-memory store can be migrated by the watcher and the eventual
+/// `changes_in_worktree_with_perm` reconcile sees identical before/after
+/// snapshots and emits no writes.
 pub fn reconcile_with_overrides_persistent(
     db: &mut but_db::DbHandle,
     gitdir: &Path,
     assignments: &mut Vec<HunkAssignment>,
 ) -> Result<()> {
     ensure_hydrated(db, gitdir);
-    let before: HashMap<(BString, HunkHeader), SubHunkOverride> = list_overrides(gitdir)
-        .into_iter()
-        .map(|ov| ((ov.path.clone(), ov.anchor), ov))
-        .collect();
     reconcile_with_overrides(gitdir, assignments);
-    let after: HashMap<(BString, HunkHeader), SubHunkOverride> = list_overrides(gitdir)
+
+    let key = gitdir_key(gitdir);
+    let disk_rows = db.sub_hunk_overrides().list_for_gitdir(&key)?;
+    let disk_keyed: HashMap<(BString, HunkHeader), but_db::SubHunkOverrideRow> = disk_rows
         .into_iter()
+        .map(|row| {
+            let key = (
+                BString::from(row.path.clone()),
+                HunkHeader {
+                    old_start: row.anchor_old_start,
+                    old_lines: row.anchor_old_lines,
+                    new_start: row.anchor_new_start,
+                    new_lines: row.anchor_new_lines,
+                },
+            );
+            (key, row)
+        })
+        .collect();
+
+    let mem_overrides = list_overrides(gitdir);
+    let mem_keyed: HashMap<(BString, HunkHeader), &SubHunkOverride> = mem_overrides
+        .iter()
         .map(|ov| ((ov.path.clone(), ov.anchor), ov))
         .collect();
 
-    let key = gitdir_key(gitdir);
     let mut handle = db.sub_hunk_overrides_mut();
-    for ((path, anchor), _) in &before {
-        if !after.contains_key(&(path.clone(), *anchor)) {
+
+    // 1) Delete every disk row whose `(path, anchor)` is no longer in memory.
+    for (k, _) in &disk_keyed {
+        if !mem_keyed.contains_key(k) {
             handle.delete(
                 &key,
-                path,
-                anchor.old_start,
-                anchor.old_lines,
-                anchor.new_start,
-                anchor.new_lines,
+                &k.0,
+                k.1.old_start,
+                k.1.old_lines,
+                k.1.new_start,
+                k.1.new_lines,
             )?;
         }
     }
-    for ((path, anchor), ov) in &after {
-        if before.get(&(path.clone(), *anchor)).map(|o| {
-            // Cheap structural equality without requiring `PartialEq` on the
-            // whole override: compare the few fields that actually drift.
-            o.ranges == ov.ranges
-                && o.assignments == ov.assignments
-                && o.anchor_diff == ov.anchor_diff
-        }) == Some(true)
-        {
-            continue;
-        }
-        match to_db_row(gitdir, ov)? {
-            Some(row) => handle.upsert(row)?,
+
+    // 2) Upsert every in-memory override that is missing from disk or
+    //    differs structurally. Skips no-op upserts to avoid pointless writes.
+    for (k, ov) in &mem_keyed {
+        let disk = disk_keyed.get(k);
+        let candidate = match to_db_row(gitdir, ov)? {
+            Some(row) => row,
             None => {
+                // Size guard refused; ensure no stale row remains.
                 let _ = handle.delete(
                     &key,
-                    &ov.path,
-                    ov.anchor.old_start,
-                    ov.anchor.old_lines,
-                    ov.anchor.new_start,
-                    ov.anchor.new_lines,
+                    &k.0,
+                    k.1.old_start,
+                    k.1.old_lines,
+                    k.1.new_start,
+                    k.1.new_lines,
                 )?;
+                continue;
             }
+        };
+        if disk == Some(&candidate) {
+            continue;
         }
+        handle.upsert(candidate)?;
     }
     Ok(())
 }

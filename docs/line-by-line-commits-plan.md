@@ -28,7 +28,7 @@ Last updated: end of "phase 5 polish + sub-hunk re-split + 6.5a" session.
 | 6.5c — Hydration on-demand (`ensure_hydrated`) + bridge (`to_db_row` / `from_db_row`) | **Shipped (this session)** | _pending_ |
 | 6.5d — Write-through on `split_hunk` / `unsplit_hunk` + read-path hydration in `changes_in_worktree_with_perm` | **Shipped (this session)** | _pending_ |
 | 6.5e — Size guard (`MAX_OVERRIDE_DB_BYTES = 64 KB`) | **Shipped (this session)** | _pending_ |
-| 6.5d-followup — Wire `reconcile_with_overrides_persistent` into `assignments_with_fallback` / `assign` (write-through on partial-commit migration / drops) | Not started | — |
+| 6.5d-followup — Wire `reconcile_with_overrides_persistent` into `assignments_with_fallback` / `assign` (write-through on partial-commit migration / drops) | **Shipped (this session)** | _pending_ |
 | **7 — Splitting committed work + cross-stack moves of split pieces** | **Not started — critical for downstream workflow** | — |
 | **⚠ Open: partial-commit content duplication on pure-add sub-hunks** | **Investigating** | — |
 
@@ -1057,14 +1057,156 @@ Manual GUI smoke against `~/buttest`:
 
 ### Recommended next-session pickup
 
-1. The `reconcile_with_overrides_persistent` wiring described above
-   — widen `assignments_with_fallback` / `assign` to take
-   `&mut DbHandle`, create the savepoint internally, and call the
-   `_persistent` variant. This eliminates the wasted-reconcile-on-
-   launch caveat above and gives the partial-commit migration
-   pipeline full disk durability.
-2. Phase 5d (Playwright) and Phase 6 polish (hunk-dep on sub-hunks,
+1. Phase 5d (Playwright) and Phase 6 polish (hunk-dep on sub-hunks,
    icon polish, Storybook).
-3. Phase 7 (committed-hunk splits + cross-stack moves), which now
+2. Phase 7 (committed-hunk splits + cross-stack moves), which now
    has a clean schema (1) it can extend to (gitdir, commit_id, path,
    anchor_*) via a `schema_version=2` migration.
+
+## What landed in the 6.5d-followup session
+
+### Phase 6.5d-followup — Persistent variants of `assign` / `assignments_with_fallback`
+
+Rather than break the existing `HunkAssignmentsHandleMut`-based
+signatures (which would force a workspace-wide refactor of every
+transaction-based caller in `but-claude`, `but/`, `gitbutler-watcher`,
+etc.), this session added two new entry points alongside the existing
+ones:
+
+- `but_hunk_assignment::assignments_with_fallback_persistent(db: &mut
+  DbHandle, repo, ws, worktree_changes, context_lines)`
+- `but_hunk_assignment::assign_persistent(db: &mut DbHandle, repo, ws,
+  requests, context_lines)`
+
+Both run `sub_hunk::reconcile_with_overrides_persistent` *before*
+taking the `hunk_assignments` savepoint, so override migrations and
+stale-anchor drops triggered by a partial-commit reconcile now write
+through to the `sub_hunk_overrides` table. The savepoint is created
+internally on the same `&mut DbHandle`, so the override write-through
+and the assignments write don't have to be interleaved at the call
+site.
+
+Wired into the high-traffic worktree paths in `crates/but-api/src/diff.rs`:
+
+- `changes_in_worktree_with_perm` (the read path that fires on every
+  worktree refresh; previously wrapped in an `immediate_transaction`
+  that's now redundant — both the savepoint and the override CRUD
+  auto-commit through the underlying connection).
+- `assign_hunk_only_with_perm` (the write path behind
+  `assign_hunk` / `assign_hunk_only`).
+- The `split_hunk_with_perm` / `unsplit_hunk_with_perm` post-mutation
+  reconcile so the materialize step also write-throughs any drops the
+  reconcile may produce.
+
+Left on the legacy / non-persistent variant for now (out of session
+scope; they'll inherit the persistence on the next pass):
+
+- `crates/but-api/src/legacy/virtual_branches.rs::unapply_stack_with_perm`
+- `crates/but-api/src/commit/{uncommit,undo}.rs` (these are
+  transaction-scoped via `db.transaction()`; routing them through
+  `*_persistent` would either (a) require dropping the explicit
+  transaction wrapper or (b) plumbing an override-aware variant onto
+  `Transaction`). Since these run after a commit/uncommit anyway,
+  the next `changes_in_worktree_with_perm` reconcile picks up the
+  shape change and write-throughs whatever the override reconcile
+  produces.
+- `crates/but-claude/src/{hooks,session}.rs`,
+  `crates/but-cursor/src/lib.rs`, `crates/but-tools/src/workspace.rs`,
+  `crates/but-rules/src/{lib,handler}.rs`,
+  `crates/gitbutler-watcher/src/handler.rs`,
+  `crates/but/src/...` and the integration tests in
+  `crates/gitbutler-branch-actions/tests/...` — these all read
+  assignments from peripheral surfaces and can keep using the
+  in-memory variant. The desktop's worktree refresh path is the
+  authoritative reconcile.
+
+Net effect: the wasted-reconcile-on-launch caveat from the prior
+session is closed for the desktop. After a partial commit that
+drops or migrates an override, the next worktree read writes the
+new override shape (or its absence) to disk, and a relaunch hydrates
+the canonical post-reconcile state directly.
+
+### Tests
+
+No new tests in this session — the new entry points reuse the
+existing `reconcile_with_overrides_persistent` machinery (whose
+integration tests in `but-hunk-assignment` cover round-trip / drop /
+migrate semantics) plus the existing assignments reconcile (covered
+by the 30+ unit tests in `crates/but-hunk-assignment/src/lib.rs`).
+The full `but-hunk-assignment` test suite (77 tests) still passes.
+
+### Smoke-test fix #1 — watcher path also needs the persistent variant
+
+First manual GUI pass against `~/buttest`:
+
+1. Split `athirdfile.md` into A/B/C.
+2. Edit the file to delete Section B's content. UI showed only A and
+   C as expected.
+3. `Cmd-Q`. Inspected `sub_hunk_overrides`: row was **stale** —
+   anchor still `+1,13` with three ranges, even though the natural
+   hunk had shrunk to `+1,8`.
+
+Root cause: the file-edit event flows through
+`gitbutler-watcher::handler::emit_worktree_changes`, which was still
+calling the legacy `but_hunk_assignment::assignments_with_fallback`
+(in-memory only). The watcher migrated the in-memory override and
+pushed assignments to the frontend; disk stayed at the pre-edit
+shape. The eventual `changes_in_worktree_with_perm` call — which
+*does* use the persistent variant — then saw
+`memory-before == memory-after` and emitted no writes.
+
+Fix:
+
+- Routed the watcher's `assignments_and_errors` helper through
+  `assignments_with_fallback_persistent` (`&mut DbHandle` was
+  already available at every call site in
+  `emit_worktree_changes`).
+
+### Smoke-test fix #2 — `reconcile_with_overrides_persistent` must compare disk vs memory
+
+Even with fix #1, the persistent variant had a latent correctness
+bug: it snapshotted the in-memory store before *and* after running
+`reconcile_with_overrides`, then wrote the diff to disk. That works
+when the persistent variant is the only mutator, but as soon as
+*any* non-persistent caller (the legacy watcher path before fix #1,
+or any peripheral caller in `but-claude` / `but-cursor` /
+`but-tools` / `but-rules` / `but/` / etc.) runs first, the
+in-memory store moves ahead of disk and `before == after` from the
+persistent variant's perspective even though disk is wrong.
+
+Fix in `crates/but-hunk-assignment/src/sub_hunk.rs`:
+
+- Reworked `reconcile_with_overrides_persistent` to read the
+  authoritative *disk* state via
+  `db.sub_hunk_overrides().list_for_gitdir(&key)?` after the
+  in-memory reconcile, key both sides by `(path, anchor)`, and emit
+  writes whenever they diverge:
+  - Disk has a row with no in-memory match → `delete`.
+  - In-memory entry has no disk match → `upsert`.
+  - Both present but the serialized row differs → `upsert`.
+  - Identical → skip.
+- The `to_db_row(...)? == None` branch (size-guard refusal) still
+  proactively `delete`s any stale row for the same key, matching
+  the existing `upsert_override_persistent` semantics.
+
+This closes the drift window regardless of which non-persistent
+caller mutated memory first; the next persistent call always
+reconciles disk to canonical post-reconcile memory.
+
+### Re-validation against `~/buttest`
+
+1. Split `splittest_pure_add.md` into A/B/C, partial-commit B.
+2. Split `athirdfile.md` into A/B/C, edit out Section B.
+3. `Cmd-Q`. Inspect `sub_hunk_overrides`:
+
+```
+path                   o_s  o_l  n_s  n_l  ranges_json
+splittest_pure_add.md  1    6    1    19   [{0,9},{15,19}]
+athirdfile.md          1    1    1    8    [{1,4},{4,8}]
+```
+
+Both rows match the live `git diff HEAD` shape exactly. The
+migrated post-partial-commit override on `splittest_pure_add.md`
+and the migrated post-edit override on `athirdfile.md` are now
+durably persisted on the same tick as the in-memory mutation.
+✅

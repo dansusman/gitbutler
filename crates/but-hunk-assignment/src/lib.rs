@@ -492,6 +492,111 @@ pub fn assignments_with_fallback(
     Ok((hunk_assignments, None))
 }
 
+/// Persistent variant of [`assignments_with_fallback`].
+///
+/// Identical to [`assignments_with_fallback`] except that the override
+/// reconcile pass runs through
+/// [`sub_hunk::reconcile_with_overrides_persistent`], so any drops or
+/// migrations the pass performs are written through to the
+/// `sub_hunk_overrides` table on the same `DbHandle`.
+///
+/// Prefer this variant from any callsite that already holds an exclusive
+/// `&mut DbHandle`. The savepoint over `hunk_assignments` is created
+/// internally so callers don't have to interleave override write-through
+/// with the assignments savepoint themselves.
+pub fn assignments_with_fallback_persistent(
+    db: &mut but_db::DbHandle,
+    repo: &gix::Repository,
+    workspace: &but_graph::projection::Workspace,
+    worktree_changes: Option<impl IntoIterator<Item = impl Into<but_core::TreeChange>>>,
+    context_lines: u32,
+) -> Result<(Vec<HunkAssignment>, Option<anyhow::Error>)> {
+    let worktree_changes: Vec<but_core::TreeChange> = match worktree_changes {
+        Some(wtc) => wtc.into_iter().map(Into::into).collect(),
+        None => but_core::diff::worktree_changes(repo)?.changes,
+    };
+
+    if worktree_changes.is_empty() {
+        return Ok((vec![], None));
+    }
+    let mut worktree_assignments = vec![];
+    for change in &worktree_changes {
+        let diff = change.unified_patch(repo, context_lines);
+        worktree_assignments.extend(HunkAssignment::from_tree_change(
+            change,
+            diff.ok().flatten(),
+        ));
+    }
+    // Run the override reconcile *with write-through to disk* before we
+    // grab the assignments savepoint, so partial-commit migrations and
+    // stale-anchor drops survive an app relaunch.
+    sub_hunk::reconcile_with_overrides_persistent(
+        db,
+        repo.git_dir(),
+        &mut worktree_assignments,
+    )?;
+
+    let handle = db.hunk_assignments_mut()?;
+    let mut reconciled =
+        reconcile_with_worktree(handle.to_ref(), workspace, &worktree_assignments)?;
+    derive_stack_ids(&mut reconciled, workspace);
+    state::set_assignments(handle, reconciled.clone())?;
+    Ok((reconciled, None))
+}
+
+/// Persistent variant of [`assign`]. See
+/// [`assignments_with_fallback_persistent`] for the rationale; this
+/// function is the analogous wrapper for the assignment-write path.
+pub fn assign_persistent(
+    db: &mut but_db::DbHandle,
+    repo: &gix::Repository,
+    workspace: &but_graph::projection::Workspace,
+    requests: Vec<HunkAssignmentRequest>,
+    context_lines: u32,
+) -> Result<()> {
+    let branches_by_stack = workspace_branches_by_stack(workspace);
+
+    let worktree_changes: Vec<but_core::TreeChange> =
+        but_core::diff::worktree_changes(repo)?.changes;
+    let mut worktree_assignments = vec![];
+    for change in &worktree_changes {
+        let diff = change.unified_patch(repo, context_lines);
+        worktree_assignments.extend(HunkAssignment::from_tree_change(
+            change,
+            diff.ok().flatten(),
+        ));
+    }
+    sub_hunk::reconcile_with_overrides_persistent(
+        db,
+        repo.git_dir(),
+        &mut worktree_assignments,
+    )?;
+
+    let handle = db.hunk_assignments_mut()?;
+    let mut persisted_assignments = state::assignments(handle.to_ref())?;
+    backfill_branch_ref_from_legacy_stack_id(&mut persisted_assignments, workspace);
+    let with_worktree = reconcile::assignments(
+        &worktree_assignments,
+        &persisted_assignments,
+        &branches_by_stack,
+        MultipleOverlapping::SetMostLines,
+        true,
+    );
+
+    let request_assignments = requests_to_assignments(requests, workspace)?;
+    let mut with_requests = reconcile::assignments(
+        &with_worktree,
+        &request_assignments,
+        &branches_by_stack,
+        MultipleOverlapping::SetMostLines,
+        true,
+    );
+
+    derive_stack_ids(&mut with_requests, workspace);
+    state::set_assignments(handle, with_requests)?;
+    Ok(())
+}
+
 fn reconcile_worktree_changes_with_worktree(
     db: HunkAssignmentsHandleMut,
     repo: &gix::Repository,

@@ -3,7 +3,6 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::{Context as _, Result};
 use but_core::{TreeChange, sync::RepoExclusive};
 use but_ctx::{Context, ProjectHandleOrLegacyProjectId};
-use but_db::HunkAssignmentsHandleMut;
 use but_hunk_assignment::HunkAssignment;
 use but_hunk_dependency::ui::hunk_dependencies_for_workspace_changes_by_worktree_dir;
 use but_settings::{AppSettings, AppSettingsWithDiskSync};
@@ -107,7 +106,7 @@ impl Handler {
         );
 
         let (assignments, assignments_error) = assignments_and_errors(
-            db.hunk_assignments_mut()?,
+            &mut db,
             &repo,
             &ws,
             wt_changes.changes.clone(),
@@ -132,7 +131,7 @@ impl Handler {
             let (repo, ws, mut db) = ctx.workspace_and_db_mut_with_perm(perm.read_permission())?;
             // Getting these again since they were updated
             let (assignments, assignments_error) = assignments_and_errors(
-                db.hunk_assignments_mut()?,
+                &mut db,
                 &repo,
                 &ws,
                 wt_changes.changes.clone(),
@@ -230,14 +229,19 @@ fn head_info(ctx: &mut Context) -> Result<(String, String)> {
 }
 
 fn assignments_and_errors(
-    db: HunkAssignmentsHandleMut,
+    db: &mut but_db::DbHandle,
     repo: &gix::Repository,
     workspace: &but_graph::projection::Workspace,
     tree_changes: Vec<TreeChange>,
     context_lines: u32,
 ) -> Result<(Vec<HunkAssignment>, Option<serde_error::Error>)> {
+    // Phase 6.5d-followup: route the watcher through the persistent
+    // variant so override migrations / drops triggered by a file edit
+    // write through to disk on the same tick. Without this, the
+    // in-memory store moves ahead of disk and the eventual
+    // `changes_in_worktree_with_perm` sees no drift to write.
     let (assignments, assignments_error) = {
-        but_hunk_assignment::assignments_with_fallback(
+        but_hunk_assignment::assignments_with_fallback_persistent(
             db,
             repo,
             workspace,

@@ -150,11 +150,14 @@ pub fn changes_in_worktree_with_perm(
         &ws,
         Some(changes.changes.clone()),
     );
-    let mut trans = db.immediate_transaction()?;
 
+    // Phase 6.5d-followup: route through the persistent variant so the
+    // override reconcile pass writes through partial-commit migrations
+    // and stale-anchor drops to the `sub_hunk_overrides` table. The
+    // savepoint over `hunk_assignments` is created internally.
     let (assignments, assignments_error) = {
-        but_hunk_assignment::assignments_with_fallback(
-            trans.hunk_assignments_mut()?,
+        but_hunk_assignment::assignments_with_fallback_persistent(
+            &mut db,
             &repo,
             &ws,
             Some(changes.changes.clone()),
@@ -162,7 +165,6 @@ pub fn changes_in_worktree_with_perm(
         )?
     };
 
-    trans.commit()?;
     drop((repo, ws, db));
     #[cfg(feature = "legacy")]
     but_rules::handler::process_workspace_rules(ctx, &assignments, perm).ok();
@@ -208,8 +210,11 @@ pub fn assign_hunk_only_with_perm(
 ) -> anyhow::Result<()> {
     let context_lines = ctx.settings.context_lines;
     let (repo, ws, mut db) = ctx.workspace_mut_and_db_mut_with_perm(perm)?;
-    but_hunk_assignment::assign(
-        db.hunk_assignments_mut()?,
+    // Phase 6.5d-followup: persistent variant so override migrations /
+    // drops triggered by the assignment reconcile survive an app
+    // relaunch.
+    but_hunk_assignment::assign_persistent(
+        &mut db,
         &repo,
         &ws,
         assignments,
@@ -381,9 +386,10 @@ pub fn split_hunk_with_perm(
     )?;
 
     // Trigger a reconcile so the persisted assignments and downstream consumers
-    // see the materialized sub-hunks.
-    but_hunk_assignment::assignments_with_fallback(
-        db.hunk_assignments_mut()?,
+    // see the materialized sub-hunks. Use the persistent variant so any
+    // override migration the reconcile triggers writes through to disk.
+    but_hunk_assignment::assignments_with_fallback_persistent(
+        &mut db,
         &repo,
         &ws,
         Some(changes),
@@ -427,8 +433,8 @@ pub fn unsplit_hunk_with_perm(
     let _removed = but_hunk_assignment::remove_override_persistent(
         &mut db, &gitdir, &path, anchor,
     )?;
-    but_hunk_assignment::assignments_with_fallback(
-        db.hunk_assignments_mut()?,
+    but_hunk_assignment::assignments_with_fallback_persistent(
+        &mut db,
         &repo,
         &ws,
         None::<Vec<but_core::TreeChange>>,
