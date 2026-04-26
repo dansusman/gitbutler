@@ -189,6 +189,8 @@ commands.allow = [
   "snapshot_diff",
   "split_branch",
   "split_branch_into_dependent_branch",
+  "split_hunk",
+  "unsplit_hunk",
   "squash_commits",
   "stack_details",
   "stacks",

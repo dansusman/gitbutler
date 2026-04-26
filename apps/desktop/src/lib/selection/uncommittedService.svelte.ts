@@ -5,6 +5,7 @@ import {
 	hunkHeaderEquals,
 	lineIdsToHunkHeaders,
 	orderHeaders,
+	splitDiffHunkByHeaders,
 } from "$lib/hunks/hunk";
 import { showToast } from "$lib/notifications/toasts";
 import { compositeKey, partialKey, type HunkSelection } from "$lib/selection/entityAdapters";
@@ -89,14 +90,27 @@ export class UncommittedService {
 	findHunkDiff(changeDiff: UnifiedDiff | null, hunk: HunkHeader): DiffHunk | undefined {
 		if (changeDiff?.type !== "Patch") return undefined;
 
-		const hunkDiff = changeDiff.subject.hunks.find(
-			(hunkDiff) =>
-				hunkDiff.oldStart === hunk.oldStart &&
-				hunkDiff.oldLines === hunk.oldLines &&
-				hunkDiff.newStart === hunk.newStart &&
-				hunkDiff.newLines === hunk.newLines,
-		);
-		return hunkDiff;
+		// First try an exact match — a natural hunk produced by `git diff`.
+		const exact = changeDiff.subject.hunks.find((hunkDiff) => hunkHeaderEquals(hunkDiff, hunk));
+		if (exact) return exact;
+
+		// Otherwise look for a natural hunk that *contains* `hunk` — the
+		// signature of a sub-hunk produced by `split_hunk` on the backend.
+		// Synthesize the sub-hunk's diff text so callers can encode it for
+		// commit just like a normal hunk.
+		for (const candidate of changeDiff.subject.hunks) {
+			if (
+				hunk.oldStart >= candidate.oldStart &&
+				hunk.oldStart + hunk.oldLines <= candidate.oldStart + candidate.oldLines &&
+				hunk.newStart >= candidate.newStart &&
+				hunk.newStart + hunk.newLines <= candidate.newStart + candidate.newLines
+			) {
+				const split = splitDiffHunkByHeaders(candidate, [hunk]);
+				const match = split.find((s) => hunkHeaderEquals(s.hunk, hunk));
+				if (match) return match.hunk;
+			}
+		}
+		return undefined;
 	}
 
 	/**
