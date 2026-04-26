@@ -4,7 +4,7 @@ Companion to [`line-by-line-commits.md`](./line-by-line-commits.md). That
 document is the design spec; this one tracks what's actually shipped, what
 the smoke test surfaced, and what's still to do.
 
-Last updated: end of "phase 4.5 + amend-fix" session.
+Last updated: end of "phase 5 polish + sub-hunk re-split + 6.5a" session.
 
 ## Status snapshot
 
@@ -16,12 +16,17 @@ Last updated: end of "phase 4.5 + amend-fix" session.
 | 4 — Split icon + un-split | **Shipped** | `57f900cabe` |
 | Smoke-test fixups (tauri allowlist + commit-path containment) | **Shipped** | `1e2941ece1` |
 | `safe_checkout` post-commit fix | **Shipped** | `6108897acb` |
-| 4.5 — Override survival across partial commits (residuals stored, multi-candidate fan-out, order-preserving alignment) | **Shipped (uncommitted)** | — |
-| Drag-amend re-encoding for sub-hunks (`AmendCommitWithHunkDzHandler`) | **Shipped (uncommitted)** | — |
-| 5 — Gesture rewrite + popover | Not started | — |
-| 6 — Polish (deps, doc updates, etc.) | Not started | — |
-| 6.5 — Disk persistence of overrides (worktree scope) | Not started — nice-to-have | — |
+| 4.5 — Override survival across partial commits (residuals stored, multi-candidate fan-out, order-preserving alignment) | **Shipped** | `3e86b4f6e5` |
+| Drag-amend re-encoding for sub-hunks (`AmendCommitWithHunkDzHandler`) | **Shipped** | `355e45ed97` |
+| 4.5b — Migration re-introduces residuals after uncommit | **Shipped (this session)** | _pending_ |
+| 5a/b/c — Gesture rewrite + popover (Stage / Comment / Split / Cancel) | **Shipped (this session)** | _pending_ |
+| 5d — Single-tap opens popover + sub-hunk re-split (merge into existing override) | **Shipped (this session)** | _pending_ |
+| 5e — Polish: blank-`+` row absorption in Split gesture; sub-hunk discard re-encoding | **Shipped (this session)** | _pending_ |
+| 6 — Polish (hunk-dep on sub-hunks, storybook, etc.) | Not started | — |
+| 6.5a — Serde-fy `SubHunkOverride` (in-memory round-trip) | **Shipped (this session)** | _pending_ |
+| 6.5b–e — `but-db` schema, hydration, write-through, size guards | Not started — next | — |
 | **7 — Splitting committed work + cross-stack moves of split pieces** | **Not started — critical for downstream workflow** | — |
+| **⚠ Open: partial-commit content duplication on pure-add sub-hunks** | **Investigating** | — |
 
 ## What's validated end-to-end (manual GUI smoke test against `~/buttest`)
 
@@ -579,19 +584,255 @@ Items deferred during 1–5:
    sub-hunk. Requires extra design for stack-target selection.
 8. **Doc updates** per the corrections list above.
 
+## What landed in the phase 5-polish + sub-hunk re-split + 6.5a session
+
+### Phase 4.5b — Migration re-introduces residuals after uncommit
+
+**Bug:** the doc-stage Phase 4.5 migration (`migrate_override_multi`)
+emitted only the user-range remappings that survived the new anchor's
+row shape. Rows that *re-appeared* in the natural hunk — the case
+where the user uncommits a partial commit and the natural hunk grows
+back — were left uncovered, and `materialize_override` silently
+dropped them from the rendered diff. End-result: "Section A" /
+"Section B" disappear from the worktree view after an uncommit, even
+though the worktree still contains them.
+
+**Fix:** after remapping each old user range onto the new candidate
+anchor, run `materialize_residual_ranges` over the surviving set. The
+function already knows how to fill non-context gaps with trimmed
+residuals; it just wasn't being called on the migration path.
+
+**Tests:**
+- New regression `migration_re_introduces_residuals_after_uncommit`
+  in `crates/but-hunk-assignment/src/sub_hunk.rs`. Pre-state is a
+  partial-commit shape `(-1,3 +1,5)` with two user picks at indices 1
+  and 3 (rows 0/2/4 are now context). Post-state is the
+  uncommitted-back `(-1,0 +1,5)` with all rows added. Asserts the
+  migrated override carries five disjoint ranges covering rows 0–4
+  individually.
+- Pre-existing `migration_handles_duplicate_blank_rows_in_single_candidate`
+  test data was malformed (Rust `\` line-continuation eats the
+  leading-space context marker, so `" - alpha line one"` was parsing
+  as `Remove`). Switched the literal to `\x20` for context lines
+  so the test reflects what real diffs look like.
+
+### Phase 5 — Gesture rewrite + popover
+
+- **5a (drag becomes selection-only).** `lineSelection.svelte.ts`
+  no longer calls `onLineClick` during `onMoveOver`. The mouseup
+  `MouseEvent` is forwarded into `LineDragEndParams.clientX` /
+  `clientY` so the popover can be anchored to the gesture endpoint.
+  The row-td `onmouseup` in `HunkDiffRow.svelte` was also updated to
+  forward the event — it fires *before* the document-level
+  `mouseup` handler and was previously calling `onEnd()` with no
+  event, dropping `clientX/Y` and falling through to the annotation
+  editor. Touch path unchanged.
+- **5b–5c (popover + Split).** New component
+  `apps/desktop/src/components/diff/HunkSelectionPopover.svelte`
+  reuses `ContextMenu` and exposes Stage/Unstage / Comment / Split /
+  Cancel. Wired in `UnifiedDiffView.svelte`:
+  - **Stage / Unstage** runs the existing
+    `uncommittedService.checkLine` / `uncheckLine` paths over the
+    selected delta lines. Label flips based on whether any selected
+    line is currently unstaged at popover-open time.
+  - **Comment** falls through to the existing `handleAnnotateDrag`
+    flow.
+  - **Split** translates the gesture's line-number range to a
+    body-row `RowRange` via the new `bodyRowRangeFromSelection`
+    helper in `apps/desktop/src/lib/hunks/hunk.ts` and calls
+    `diffService.splitHunk`. Validates per the spec (no
+    context-only, no whole-hunk). Disabled (with a tooltip) on
+    committed-hunk views — Phase 7 is required to actually split
+    those.
+  - `Enter` triggers Stage/Unstage; `Esc` and click-outside dismiss
+    via `ContextMenu`.
+- **Single-tap also opens the popover.** `lineSelection.onEnd` now
+  fires `onDragEnd` for the no-movement case as well (when
+  `onDragEnd` is wired). Single-clicks become a 1-row range that
+  produces the same popover. The legacy synchronous-stage
+  `onLineClick` path stays as a fallback for consumers that don't
+  wire `onDragEnd` (Storybook, commit views without the popover).
+- **Sub-hunk re-split.** Backend
+  `split_hunk_with_perm` now merges new ranges into an existing
+  override via the new `merge_user_ranges_into_partition` helper
+  rather than replacing it. The frontend popover always operates
+  against the *natural* anchor hunk (looked up by
+  `subAnchor` when `isSubHunk`) so re-splitting an already-split
+  sub-hunk refines the partition rather than erroring out on
+  anchor mismatch. Tests cover split-at-boundary, span-carve,
+  no-op-when-already-aligned, and empty-input passthrough.
+- **Popover anchor element.** Synthesized `MouseEvent`s passed as
+  `ContextMenu`'s `target` tripped Svelte 5's
+  `state_descriptors_fixed` runtime check (MouseEvent properties
+  are getter-only and don't satisfy the `$state`-stored object
+  contract). Fixed by anchoring the popover to a transient
+  zero-size `position: fixed` div at the gesture coordinates and
+  passing that as the target instead.
+- **`linesInSelection` snapshot before redux dispatch.** Items
+  pushed into a `$state`-backed array become Svelte 5 proxies; the
+  Stage handler's `uncommittedService.checkLine(... , line)` chain
+  re-entered Svelte's event runtime with proxy property descriptors
+  and threw `state_descriptors_fixed`. Fixed by snapshotting each
+  line into a plain `{ newLine, oldLine }` literal before passing
+  to the dispatch.
+- **Helpers.** `bodyRowRangeFromSelection`,
+  `countDeltaRowsInRange`, `countBodyRows`, and
+  `expandRangeToAbsorbBlankAddRows` added to `hunk.ts` with vitest
+  coverage. The last one handles the blank-residual UX issue — see
+  Phase 5e below.
+- **Doc cleanup.** `docs/lock-repro-steps.md` lost the dev-console
+  caveat; the repro is now a pure-GUI flow.
+
+### Phase 5e — Polish: blank-Add absorption + sub-hunk discard
+
+- **Blank-`+` row absorption in Split gesture.** Splitting a
+  multi-section pure-add hunk (e.g. ## Section A / blanks / ## Section
+  B / blanks / ## Section C) used to leave the inter-section blank
+  rows as their own 1-row sub-hunks. `expandRangeToAbsorbBlankAddRows`
+  walks the split-RPC's body-row range outward and pulls in any
+  adjacent blank-`+` rows so the user's selection eats them. Wired
+  into `applySplitToSelection` in `UnifiedDiffView.svelte`.
+- **Sub-hunk "Discard change" routed through `diffToHunkHeaders`.**
+  `discardHunk` in `HunkContextMenu.svelte` was passing the sub-hunk's
+  synthesized `HunkHeader` directly to the discard RPC, which silently
+  no-op'd because no natural worktree hunk matched. Now re-encodes
+  via `diffToHunkHeaders(item.hunk.diff, "discard")`, mirroring the
+  same containment-aware encoding the commit path uses. Natural hunks
+  pass through unchanged.
+
+## ⚠ Open issue — partial-commit content duplication on pure-add sub-hunks
+
+**Symptom (from `~/buttest/athirdfile.md`).** After splitting a
+pure-add multi-section hunk into A/B/C and committing the middle
+sub-hunk (B), the resulting HEAD blob contains Section B *twice* and
+the worktree-vs-HEAD diff still shows Section B as added (i.e. the
+commit didn't actually consume the rows from the worktree's
+perspective). Successive partial commits keep accumulating duplicates.
+
+**Snapshot of a buggy commit (`6d29c49 fdfdfdfdfdf` in test repo):**
+- Parent's `athirdfile.md`: 1 line (`Adding…`).
+- Commit's diff: `@@ -1 +1,23 @@` — 22 added rows, with Section B
+  appearing both at lines 10–13 and 17–20.
+- Natural worktree hunk before this commit had only ~17 added rows.
+  The commit somehow produced *more* added rows than existed in the
+  source, and duplicated Section B.
+
+**Hypotheses to investigate next session.** None are confirmed yet;
+add backend trace logging at the listed sites to capture the exact
+encoding path:
+
+1. `encode_sub_hunk_for_commit` produces overlapping null-side
+   header runs after a migration round (e.g. two `(-0,0 +N,K)`
+   ranges whose `[N, N+K)` spans intersect). `to_additive_hunks`
+   then applies both, double-inserting the overlapping rows.
+2. `safe_checkout`'s 3-way merge on partial commits (`base = pre-
+   commit HEAD`, `ours = post-commit HEAD`, `theirs = worktree`)
+   over-merges when `theirs` is a strict superset of `ours`,
+   leaving the committed rows still present in the worktree as if
+   they hadn't moved into HEAD.
+3. `From<HunkAssignment> for DiffSpec` emits the natural-anchor
+   header *and* the encoded sub-range when both `hunk_header` and
+   `sub_hunk_origin` are set. (Read of the impl in
+   `crates/but-hunk-assignment/src/lib.rs:145` says it picks one
+   branch, but worth a defensive trace.)
+
+**Repro recipe (manual, not yet a test).**
+1. New file `f.md` with a single-line baseline. Commit on a remote
+   branch; clone into a workspace; do not modify yet.
+2. Append three sections separated by blank lines (the exact
+   shape of `~/buttest/athirdfile.md`).
+3. In the desktop, drag-select Section A, click Split. Drag-select
+   Section B, click Split. Now you have three sub-hunks A/B/C.
+4. Commit Section B sub-hunk to a stack.
+5. Inspect HEAD's blob for `f.md`. Expectation: 4 lines added
+   (Section B + 3 betas). Reality (today): more than 4 lines, with
+   Section B duplicated.
+
+**Recovery for the dev test repo:** the duplicates are durable in
+HEAD; either undo the chain via `but undo` / GitButler UI and
+re-split, or rewrite history manually with `git rebase -i` to drop
+the bad partial commits.
+
+**Not in this session because** the fix lives in `to_additive_hunks`
+or `safe_checkout`'s 3-way merge — separate from the override-store
+and gesture work this session shipped — and needs trace-driven
+diagnosis I didn't complete.
+
+## What landed in the phase 5 + 6.5a session
+
+### Phase 5 — Gesture rewrite + popover (shipped)
+
+- **5a (drag becomes selection-only).** `lineSelection.svelte.ts`
+  no longer calls `onLineClick` during `onMoveOver`; staging on
+  `onStart` was deferred to `onEnd` for the no-movement case so
+  single-click staging is preserved while drag-staging side-effects
+  are gone. The mouseup `MouseEvent` is forwarded into
+  `LineDragEndParams.clientX` / `clientY` so the popover can be
+  anchored to the gesture endpoint. The touch path is unchanged.
+- **5b–5c (popover + Split).** New component
+  `apps/desktop/src/components/diff/HunkSelectionPopover.svelte`
+  reuses `ContextMenu` and exposes Stage/Unstage / Comment / Split /
+  Cancel. Wired in `UnifiedDiffView.svelte`:
+  - **Stage / Unstage** runs the existing
+    `uncommittedService.checkLine` / `uncheckLine` paths over the
+    selected delta lines. Label flips based on whether any selected
+    line is currently unstaged at popover-open time.
+  - **Comment** falls through to the existing `handleAnnotateDrag`
+    flow.
+  - **Split** translates the gesture's line-number range to a
+    body-row `RowRange` via the new `bodyRowRangeFromSelection`
+    helper in `apps/desktop/src/lib/hunks/hunk.ts` and calls
+    `diffService.splitHunk`. Disabled for sub-hunks (re-splitting
+    is deferred to v2 / Phase 7) and validates per the spec
+    (no context-only, no whole-hunk).
+  - `Enter` triggers Stage/Unstage; `Esc` and click-outside dismiss
+    via `ContextMenu`.
+- **Helpers.** `bodyRowRangeFromSelection`,
+  `countDeltaRowsInRange`, and `countBodyRows` added to `hunk.ts`
+  with vitest coverage.
+- **Doc cleanup.** `docs/lock-repro-steps.md` lost the dev-console
+  caveat; the repro is now a pure-GUI flow.
+
+### Phase 6.5a — Serde-fy `SubHunkOverride` (shipped)
+
+- `RowKind` and `SubHunkOverride` now derive `Serialize` /
+  `Deserialize`. The `assignments: BTreeMap<RowRange,
+  HunkAssignmentTarget>` field uses a custom `assignments_pairs`
+  serde module that emits a JSON array of `[range, target]` pairs,
+  because JSON object keys must be strings while `RowRange`
+  serializes as an object.
+- New unit test `sub_hunk::tests::sub_hunk_override_serde_round_trip`
+  exercises a fully-populated override (path, anchor, ranges,
+  per-range stack assignment, row kinds, anchor diff body) through
+  `serde_json` and verifies losslessness. Required precondition for
+  6.5b–e (DB plumbing).
+
 ## Recommended next-session order
 
-1. **Phase 4.5** (override survival). Required for any meaningful
-   partial-commit demo. ~30–60 min.
-2. **Phase 5a–5b** (drag becomes selection, popover plumbing). Test
-   that Stage/Comment/Cancel work on a real diff before adding Split.
-3. **Phase 5c** (Split wired up). At this point a non-developer can
-   actually use the feature without the dev console.
-   Once 5c lands, also strip the dev-console invocation prerequisite
-   from `docs/lock-repro-steps.md` — the lock-repro should become a
-   pure-GUI flow.
-4. **Phase 5d** (polish + Playwright).
-5. **Phase 6** items as needed.
+1. **Phase 5d** (Playwright happy-path spec covering drag→popover→
+   Split→drag-to-stack→unsplit). Smoke-tested manually; spec is
+   straightforward to write now that the gesture and popover are
+   stable.
+2. **Phase 6 polish.** Items #1 (hunk-dependency on sub-hunks —
+   add an integration test under
+   `but-hunk-dependency/src/ranges/tests/` that constructs a
+   sub-hunk via the override path and verifies dependency analysis
+   treats it identically to a natural hunk) and #2/#3 (split-icon
+   visual polish + Storybook).
+3. **Phase 6.5b–e.** Add the `sub_hunk_overrides` table to
+   `but-db` (schema, CRUD, schema-version stamp, size guards), wire
+   hydration on `Context` open, and add write-through to every
+   `upsert_override` / `remove_override` /
+   `migrate_stored_override_multi` call in
+   `crates/but-hunk-assignment/src/sub_hunk.rs`. The serde shape
+   landed in 6.5a is the format that goes into `assignments_json` /
+   `rows_json` columns; `anchor_diff` ships as a `BLOB`. Tests:
+   round-trip via temp DB, hydration runs reconcile,
+   crash-recovery between upsert and reconcile.
+4. **Phase 7.** As outlined below; explicitly inherits the 6.5
+   schema by widening the primary key from `(path, anchor_*)` to
+   `(commit_id, path, anchor_*)` via a `schema_version=2`
+   migration.
 
 ## Useful artifacts from the smoke test session
 
