@@ -12,7 +12,7 @@ use gix::{
 };
 
 use crate::{
-    TreeStatus,
+    RepositoryExt, TreeStatus,
     ext::ObjectStorageExt,
     snapshot,
     worktree::checkout::{Outcome, UncommitedWorktreeChanges},
@@ -90,11 +90,26 @@ pub fn merge_worktree_changes_into_destination_or_keep_snapshot(
             )?;
 
             if !out.is_empty() {
+                // For `KeepAndPreferTheirs` (post-commit safe_checkout) tell the merge to
+                // resolve overlapping hunks in favour of theirs (worktree). This handles
+                // partial commits where the worktree retains additional changes that
+                // overlap with what was committed: ours and theirs are textually
+                // compatible (theirs is a superset of ours) but git's diff-based merge
+                // can't see that and would otherwise report a conflict.
+                let cherry_pick_options =
+                    if matches!(uncommitted_changes, UncommitedWorktreeChanges::KeepAndPreferTheirs) {
+                        let opts = repo_in_memory
+                            .tree_merge_options()?
+                            .with_file_favor(Some(gix::merge::tree::FileFavor::Theirs));
+                        Some(opts)
+                    } else {
+                        None
+                    };
                 let resolve = crate::snapshot::resolve_tree(
                     out.snapshot_tree.attach(&repo_in_memory),
                     destination_tree_id,
                     snapshot::resolve_tree::Options {
-                        worktree_cherry_pick: None,
+                        worktree_cherry_pick: cherry_pick_options,
                     },
                 )?;
                 let new_destination_id =
@@ -119,6 +134,10 @@ pub fn merge_worktree_changes_into_destination_or_keep_snapshot(
                                 }
                             }
                             UncommitedWorktreeChanges::KeepConflictingInSnapshotAndOverwrite => {}
+                            UncommitedWorktreeChanges::KeepAndPreferTheirs => {
+                                // FileFavor::Theirs has resolved any overlapping hunks; the
+                                // merged tree carries the worktree's content and is safe to use.
+                            }
                         }
                         let res = Some(worktree_cherry_pick.tree.write()?.detach());
                         if let Some(memory) = repo_in_memory.objects.take_object_memory() {

@@ -42,11 +42,18 @@ impl<'ws, 'graph, M: RefMetadata> SuccessfulRebase<'ws, 'graph, M> {
 
                     // If the head has changed (which means it's in the
                     // commit mapping), perform a safe checkout.
+                    // Use `KeepAndPreferTheirs` here: a successful rebase
+                    // (commit_create / commit_amend) is supposed to leave the
+                    // worktree exactly as the user has it on disk. The new
+                    // commit only records part of that state, and the cherry-pick
+                    // step inside safe_checkout would otherwise spuriously
+                    // conflict on partial commits whose content is a strict
+                    // subset of the worktree's overlapping hunks.
                     safe_checkout_from_head(
                         new_head,
                         &repo,
                         Options {
-                            uncommitted_changes: UncommitedWorktreeChanges::KeepAndAbortOnConflict,
+                            uncommitted_changes: UncommitedWorktreeChanges::KeepAndPreferTheirs,
                             skip_head_update: true,
                         },
                     )?;

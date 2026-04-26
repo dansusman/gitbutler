@@ -10,6 +10,13 @@ pub enum UncommitedWorktreeChanges {
     /// Note that uncommitted changes that aren't affected will just be left as is.
     // TODO: Add a ref-name with which to associate the snapshot commit for safekeeping, but needs UI support.
     KeepConflictingInSnapshotAndOverwrite,
+    /// Keep the worktree as-is, resolving any cherry-pick conflicts in favour of the worktree's
+    /// current state. Used after a partial commit (`commit_create` / `commit_amend`): the user's
+    /// intended worktree state already exists on disk, the new commit just records part of it,
+    /// and there is nothing to overwrite. This avoids the false-positive "would be overwritten"
+    /// rejection that fires when ours (post-commit tree) and theirs (worktree tree) both modified
+    /// overlapping hunks even though theirs is a strict superset of ours.
+    KeepAndPreferTheirs,
 }
 
 /// Options for use in [super::safe_checkout()].
