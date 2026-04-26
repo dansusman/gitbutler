@@ -1,4 +1,4 @@
-import { changesToDiffSpec } from "$lib/commits/utils";
+import { changesToDiffSpec, changesToDiffSpecForCommit } from "$lib/commits/utils";
 import {
 	FileChangeDropData,
 	FolderChangeDropData,
@@ -7,6 +7,8 @@ import {
 } from "$lib/dragging/draggables";
 import { parseError } from "$lib/error/parser";
 import { HOOKS_SERVICE } from "$lib/git/hooksService";
+import { DIFF_SERVICE } from "$lib/hunks/diffService.svelte";
+import { diffToHunkHeaders, findHunkDiff } from "$lib/hunks/hunk";
 import { toCommitMovePlacement } from "$lib/stacks/commitMovePlacement";
 import { STACK_SERVICE } from "$lib/stacks/stackService.svelte";
 import { UI_STATE, withStackBusy, type UiState } from "$lib/state/uiState.svelte";
@@ -112,6 +114,7 @@ export class AmendCommitWithChangeDzHandler implements DropzoneHandler {
 	private readonly uiState = inject(UI_STATE);
 	private readonly stackService = inject(STACK_SERVICE);
 	private readonly hooksService = inject(HOOKS_SERVICE);
+	private readonly diffService = inject(DIFF_SERVICE);
 
 	constructor(
 		private projectId: string,
@@ -169,7 +172,16 @@ export class AmendCommitWithChangeDzHandler implements DropzoneHandler {
 				break;
 			case "worktree": {
 				const assignments = data.assignments();
-				const worktreeChanges = changesToDiffSpec(await data.treeChanges(), assignments);
+				// Use the commit-form encoder so sub-hunks get null-side
+				// headers the backend's `to_additive_hunks` accepts. Plain
+				// `changesToDiffSpec` would forward the synth header verbatim
+				// and trigger a "Missing diff spec association" rejection.
+				const worktreeChanges = await changesToDiffSpecForCommit(
+					this.projectId,
+					await data.treeChanges(),
+					assignments,
+					this.diffService,
+				);
 
 				if (this.runHooks) {
 					try {
@@ -327,6 +339,7 @@ export class AmendCommitWithHunkDzHandler implements DropzoneHandler {
 	private readonly uiState = inject(UI_STATE);
 	private readonly stackService = inject(STACK_SERVICE);
 	private readonly hooksService = inject(HOOKS_SERVICE);
+	private readonly diffService = inject(DIFF_SERVICE);
 
 	constructor(
 		private args: {
@@ -403,18 +416,31 @@ export class AmendCommitWithHunkDzHandler implements DropzoneHandler {
 				return;
 			}
 
-			const worktreeChanges = [
-				{
-					previousPathBytes,
-					pathBytes: data.change.pathBytes,
-					hunkHeaders: [
+			// Re-encode the hunk via `diffToHunkHeaders` so sub-hunk synth
+			// headers (old_lines=0 with old_start != 0) get expanded into
+			// pure null-side `(-0,0 +N,M)` / `(-N,M +0,0)` runs the backend's
+			// `to_additive_hunks` accepts via containment matching. Passing
+			// the synth header verbatim trips the "Missing diff spec
+			// association" rejection because it isn't a natural worktree
+			// hunk and isn't `is_null()` either (start != 0). The same
+			// re-encoding is a no-op for natural hunks.
+			const fileDiff = await this.diffService.fetchDiff(projectId, data.change);
+			const hunkDiff = findHunkDiff(fileDiff, data.hunk);
+			const hunkHeaders = hunkDiff
+				? diffToHunkHeaders(hunkDiff.diff, "commit")
+				: [
 						{
 							oldStart: data.hunk.oldStart,
 							oldLines: data.hunk.oldLines,
 							newStart: data.hunk.newStart,
 							newLines: data.hunk.newLines,
 						},
-					],
+					];
+			const worktreeChanges = [
+				{
+					previousPathBytes,
+					pathBytes: data.change.pathBytes,
+					hunkHeaders,
 				},
 			];
 

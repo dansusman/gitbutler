@@ -6,6 +6,7 @@ import {
 	type LineId,
 	type LineLock,
 } from "@gitbutler/ui/utils/diffParsing";
+import type { UnifiedDiff } from "$lib/hunks/diff";
 import type { HunkLocks } from "$lib/hunks/dependencies";
 import type { DiffHunk, HunkHeader } from "@gitbutler/but-sdk";
 
@@ -204,6 +205,39 @@ export function diffToHunkHeaders(diff: string, action: "discard" | "commit"): H
 	const [lineGroups, parentHunkHeader] = extractAllGroups(diff);
 
 	return lineGroups.map((lineGroup) => lineGroupsToHunkHeader(lineGroup, parentHunkHeader, action));
+}
+
+/**
+ * Find the `DiffHunk` in `changeDiff` that corresponds to `hunk`.
+ *
+ * First tries an exact header match (a natural hunk produced by `git diff`).
+ * Falls back to a containment match — the signature of a sub-hunk produced
+ * by `split_hunk` on the backend. In the containment case, the returned
+ * `DiffHunk` is a synthetic slice of the parent natural hunk carrying just
+ * the rows belonging to `hunk`.
+ */
+export function findHunkDiff(
+	changeDiff: UnifiedDiff | null,
+	hunk: HunkHeader,
+): DiffHunk | undefined {
+	if (changeDiff?.type !== "Patch") return undefined;
+
+	const exact = changeDiff.subject.hunks.find((hunkDiff) => hunkHeaderEquals(hunkDiff, hunk));
+	if (exact) return exact;
+
+	for (const candidate of changeDiff.subject.hunks) {
+		if (
+			hunk.oldStart >= candidate.oldStart &&
+			hunk.oldStart + hunk.oldLines <= candidate.oldStart + candidate.oldLines &&
+			hunk.newStart >= candidate.newStart &&
+			hunk.newStart + hunk.newLines <= candidate.newStart + candidate.newLines
+		) {
+			const split = splitDiffHunkByHeaders(candidate, [hunk]);
+			const match = split.find((s) => hunkHeaderEquals(s.hunk, hunk));
+			if (match) return match.hunk;
+		}
+	}
+	return undefined;
 }
 
 export function isDiffHunk(something: unknown): something is DiffHunk {
