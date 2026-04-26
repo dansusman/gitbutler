@@ -103,7 +103,7 @@
 		class:stagable={isSelectingForCommit}
 		onmousedown={(ev) => lineSelection.onStart(ev, row, idx)}
 		onmouseenter={(ev) => lineSelection.onMoveOver(ev, row, idx)}
-		onmouseup={() => lineSelection.onEnd()}
+		onmouseup={(ev) => lineSelection.onEnd(ev)}
 		oncontextmenu={(ev) => {
 			ev.preventDefault();
 			ev.stopPropagation();
@@ -143,7 +143,7 @@
 			class:locked
 			onmousedown={(ev) => lineSelection.onStart(ev, row, idx)}
 			onmouseenter={(ev) => lineSelection.onMoveOver(ev, row, idx)}
-			onmouseup={() => lineSelection.onEnd()}
+			onmouseup={(ev) => lineSelection.onEnd(ev)}
 			oncontextmenu={(ev) => {
 				ev.preventDefault();
 				ev.stopPropagation();

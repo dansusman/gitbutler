@@ -8,7 +8,12 @@ import {
 	orderHeaders,
 	diffToHunkHeaders,
 	splitDiffHunkByHeaders,
+	bodyRowRangeFromSelection,
+	countDeltaRowsInRange,
+	countBodyRows,
+	expandRangeToAbsorbBlankAddRows,
 } from "$lib/hunks/hunk";
+import type { DiffHunk } from "@gitbutler/but-sdk";
 import { describe, expect, test } from "vitest";
 import type { LineId } from "@gitbutler/ui/utils/diffParsing";
 
@@ -1231,5 +1236,125 @@ describe.concurrent("splitDiffHunkByHeaders", () => {
 		]);
 		expect(result).toHaveLength(2);
 		expect(result[1]!.hunk.diff).toContain("\\ No newline at end of file");
+	});
+});
+
+describe("bodyRowRangeFromSelection / countDeltaRowsInRange / countBodyRows", () => {
+	const mixed = {
+		oldStart: 5,
+		oldLines: 3,
+		newStart: 5,
+		newLines: 4,
+		diff: `@@ -5,3 +5,4 @@
+ c1
+-r1
++a1
++a2
+ c2
+`,
+	};
+
+	test("countBodyRows skips header and trailing newline", () => {
+		expect(countBodyRows(mixed)).toBe(5);
+	});
+
+	test("selecting all delta rows in newRange returns the contiguous range", () => {
+		const r = bodyRowRangeFromSelection(mixed, undefined, { startLine: 5, endLine: 7 });
+		expect(r).toEqual({ start: 0, end: 4 });
+	});
+
+	test("selecting only the removed line yields a single-row range", () => {
+		const r = bodyRowRangeFromSelection(mixed, { startLine: 6, endLine: 6 }, undefined);
+		expect(r).toEqual({ start: 1, end: 2 });
+	});
+
+	test("selecting only the added lines yields a 2-row range", () => {
+		const r = bodyRowRangeFromSelection(mixed, undefined, { startLine: 6, endLine: 7 });
+		expect(r).toEqual({ start: 2, end: 4 });
+	});
+
+	test("selecting only context returns the context row range", () => {
+		const r = bodyRowRangeFromSelection(mixed, undefined, { startLine: 5, endLine: 5 });
+		// row 0 is the leading context "c1" (newLine=5)
+		expect(r).toEqual({ start: 0, end: 1 });
+	});
+
+	test("countDeltaRowsInRange counts only +/- rows", () => {
+		// Range covering everything: 1 removed + 2 added = 3
+		expect(countDeltaRowsInRange(mixed, { start: 0, end: 5 })).toBe(3);
+		// Range covering just the leading context row:
+		expect(countDeltaRowsInRange(mixed, { start: 0, end: 1 })).toBe(0);
+	});
+
+	test("returns null when no rows match the selection", () => {
+		const r = bodyRowRangeFromSelection(
+			mixed,
+			{ startLine: 100, endLine: 200 },
+			{ startLine: 100, endLine: 200 },
+		);
+		expect(r).toBeNull();
+	});
+});
+
+describe("expandRangeToAbsorbBlankAddRows", () => {
+	const sectioned: DiffHunk = {
+		oldStart: 1,
+		oldLines: 0,
+		newStart: 1,
+		newLines: 11,
+		diff: [
+			"@@ -1,0 +1,11 @@",
+			"+## Section A",
+			"+- alpha 1",
+			"+- alpha 2",
+			"+",
+			"+",
+			"+## Section B",
+			"+- beta 1",
+			"+- beta 2",
+			"+",
+			"+## Section C",
+			"+- gamma 1",
+			"",
+		].join("\n"),
+	};
+
+	test("absorbs trailing blank Add rows after a user range", () => {
+		// User selected Section A (rows 0..2, body indices). Expand
+		// should pull the two trailing blank rows in.
+		const expanded = expandRangeToAbsorbBlankAddRows(sectioned, { start: 0, end: 3 });
+		expect(expanded).toEqual({ start: 0, end: 5 });
+	});
+
+	test("absorbs blank Add rows on both sides of a user range", () => {
+		// User selected Section B + betas (indices 5..7). Expand should
+		// pull the two leading blanks in (rows 3,4) and the trailing
+		// blank between B and C (row 8).
+		const expanded = expandRangeToAbsorbBlankAddRows(sectioned, { start: 5, end: 8 });
+		expect(expanded).toEqual({ start: 3, end: 9 });
+	});
+
+	test("does not cross non-blank Add rows", () => {
+		// Range that doesn't have adjacent blanks.
+		const expanded = expandRangeToAbsorbBlankAddRows(sectioned, { start: 0, end: 1 });
+		expect(expanded).toEqual({ start: 0, end: 1 });
+	});
+
+	test("never expands past hunk boundaries", () => {
+		const expanded = expandRangeToAbsorbBlankAddRows(sectioned, { start: 0, end: 11 });
+		expect(expanded).toEqual({ start: 0, end: 11 });
+	});
+
+	test("blank-only spans collapse onto themselves (no neighbors)", () => {
+		const onlyBlanks: DiffHunk = {
+			oldStart: 1,
+			oldLines: 0,
+			newStart: 1,
+			newLines: 2,
+			diff: "@@ -1,0 +1,2 @@\n+\n+\n",
+		};
+		// Selecting one of the two blanks expands to include the other.
+		const expanded = expandRangeToAbsorbBlankAddRows(onlyBlanks, { start: 0, end: 1 });
+		expect(expanded).toEqual({ start: 0, end: 2 });
 	});
 });

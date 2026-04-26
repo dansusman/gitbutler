@@ -48,15 +48,11 @@ current set.
    block lives in its own sub-hunk. This keeps the original baseline
    rows out of every range — they're context above the diff.
 
-   **Today (pre-phase 5):** splitting requires the dev-console
-   `invoke('split_hunk', ...)` snippet from
-   `docs/line-by-line-commits-plan.md` § *Useful artifacts*. The
-   anchor for `athirdfile.md` after step 1 is
-   `{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 16 }` and the
-   three section ranges are `[1, 6)`, `[6, 11)`, `[11, 16)`.
-
-   **Once phase 5c ships:** drag-select the rows in the GUI and pick
-   *Split hunk* from the popover. Delete this caveat at that point.
+   In the GUI, drag-select the rows of `## Section A` and pick
+   *Split* from the popover that appears on mouseup. The hunk will
+   render as a 2-way split. Repeat the gesture against the lower
+   residual to carve out `## Section B`, leaving you with three
+   sub-hunks (`## Section A` / `## Section B` / `## Section C`).
 
 3. Commit the middle sub-hunk (`## Section B`) to any stack.
 

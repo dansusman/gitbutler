@@ -22,6 +22,13 @@ export interface LineDragEndParams {
 	startIdx: number;
 	endIdx: number;
 	rows: Row[] | undefined;
+	/**
+	 * The DOM coordinates of the mouseup that ended the drag. Forwarded
+	 * so callers can anchor a popover (see Phase 5 of the line-by-line
+	 * commits design). May be `undefined` for synthetic / touch paths.
+	 */
+	clientX?: number;
+	clientY?: number;
 }
 
 type ToggleLineSelectionFn = (params: LineSelectionParams) => void;
@@ -54,9 +61,9 @@ export default class LineSelection {
 
 	constructor() {
 		if (typeof document !== 'undefined') {
-			document.addEventListener('mouseup', () => {
+			document.addEventListener('mouseup', (ev: MouseEvent) => {
 				if (this._selectionStart !== undefined) {
-					this.onEnd();
+					this.onEnd(ev);
 				}
 			});
 		}
@@ -74,6 +81,15 @@ export default class LineSelection {
 		this.onDragEnd = fn;
 	}
 
+	/**
+	 * The shift/ctrl modifier state captured at gesture start. Used so
+	 * single-click staging (deferred to mouseup) can preserve modifier
+	 * semantics from the original mousedown.
+	 */
+	private _startShift = false;
+	private _startCtrlOrMeta = false;
+	private _startRow: Row | undefined;
+
 	onStart(ev: MouseEvent, row: Row, index: number) {
 		if (ev.buttons !== 1) return;
 		if (this.mobileTouchDevice) return;
@@ -81,22 +97,21 @@ export default class LineSelection {
 		ev.stopPropagation();
 
 		this._selectionStart = index;
+		this._startShift = ev.shiftKey;
+		this._startCtrlOrMeta = ev.ctrlKey || ev.metaKey;
+		this._startRow = row;
 		if (this.onDragEnd) {
 			this._annotDragStartIdx = index;
 			this._annotDragEndIdx = index;
 		}
-		this.onLineClick?.({
-			index,
-			oldLine: row.beforeLineNumber,
-			newLine: row.afterLineNumber,
-			shift: ev.shiftKey,
-			ctrlOrMeta: ev.ctrlKey || ev.metaKey,
-			startIndex: index,
-			rows: this.rows,
-		});
+		// Phase 5a (line-by-line commits): no longer stage on mousedown.
+		// Single-line clicks stage on mouseup-no-movement (see `onEnd`);
+		// multi-line drags open the selection popover via `onDragEnd`.
+		// This makes the popover the single decision point for what a
+		// drag means.
 	}
 
-	onMoveOver(ev: MouseEvent, row: Row, index: number) {
+	onMoveOver(ev: MouseEvent, _row: Row, index: number) {
 		if (this.mobileTouchDevice) return;
 		if (this._selectionStart === undefined) return;
 		if (ev.buttons === 1) {
@@ -107,23 +122,37 @@ export default class LineSelection {
 			if (this.onDragEnd) {
 				this._annotDragEndIdx = index;
 			}
-			this.onLineClick?.({
-				index,
-				oldLine: row.beforeLineNumber,
-				newLine: row.afterLineNumber,
-				shift: ev.shiftKey,
-				ctrlOrMeta: ev.ctrlKey || ev.metaKey,
-				startIndex: this._selectionStart,
-				rows: this.rows,
-			});
+			// Phase 5a: drag no longer stages mid-motion. Only updates the
+			// visual selection range.
 		}
 	}
 
-	onEnd() {
-		if (this._selectionStart !== undefined && this.onDragEnd && this.rows) {
+	onEnd(mouseEvent?: MouseEvent) {
+		if (this._selectionStart !== undefined && this.rows) {
 			const endIdx = this._selectionEnd ?? this._selectionStart;
 			const lo = Math.min(this._selectionStart, endIdx);
 			const hi = Math.max(this._selectionStart, endIdx);
+
+			// Phase 5 (line-by-line commits): the popover is the single
+			// decision point for what a click or drag means. We always
+			// fire `onDragEnd` (covers both single-line click and
+			// multi-line drag) so the host can open the popover at the
+			// gesture endpoint. The legacy `onLineClick` synchronous
+			// stage-on-click is only fired when no `onDragEnd` is wired,
+			// preserving Storybook / non-popover consumers.
+			if (!this.onDragEnd && lo === hi && this._startRow && this.onLineClick) {
+				this.onLineClick({
+					index: lo,
+					oldLine: this._startRow.beforeLineNumber,
+					newLine: this._startRow.afterLineNumber,
+					shift: this._startShift,
+					ctrlOrMeta: this._startCtrlOrMeta,
+					startIndex: lo,
+					rows: this.rows,
+				});
+			}
+
+			if (this.onDragEnd) {
 			const selectedRows = this.rows.slice(lo, hi + 1);
 
 			let oldMin: number | undefined;
@@ -154,7 +183,10 @@ export default class LineSelection {
 					startIdx: lo,
 					endIdx: hi,
 					rows: this.rows,
+					clientX: mouseEvent?.clientX,
+					clientY: mouseEvent?.clientY,
 				});
+			}
 			}
 		}
 		this._touchMove = undefined;
@@ -163,6 +195,7 @@ export default class LineSelection {
 		this._selectionEnd = undefined;
 		this._annotDragStartIdx = undefined;
 		this._annotDragEndIdx = undefined;
+		this._startRow = undefined;
 	}
 
 	onTouchStart(ev: TouchEvent) {

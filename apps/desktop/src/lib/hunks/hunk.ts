@@ -584,3 +584,160 @@ export function orderHeaders(a: HunkHeader, b: HunkHeader): number {
 	const startB = b.oldStart || b.newStart;
 	return startA - startB;
 }
+
+/**
+ * Given a natural hunk and a user-selected line range (in "before" /
+ * "after" line-number space, as produced by the drag gesture's
+ * `LineDragEndParams`), compute the corresponding body-row range
+ * (`{start, end}`, half-open, body-row indices) suitable for the
+ * `split_hunk` RPC.
+ *
+ * Walks the unified-diff body of `hunk` line-by-line, mirroring the
+ * row-counter logic in `splitDiffHunkByHeaders`. A row is considered
+ * "in selection" when:
+ *  - it is a `+` row whose `afterLineNumber` falls within `newRange`, or
+ *  - it is a `-` row whose `beforeLineNumber` falls within `oldRange`, or
+ *  - it is a context row whose `afterLineNumber` falls within `newRange`
+ *    (allowing leading/trailing context to be trimmed by the backend).
+ *
+ * Returns `null` if no body row matches the selection.
+ *
+ * Phase 5 (line-by-line commits): the popover's Split action calls this
+ * to translate the gesture's line-number ranges into the row-range
+ * payload expected by `split_hunk`. Backend trims leading/trailing
+ * context implicitly per validation rule 4.
+ */
+export function bodyRowRangeFromSelection(
+	hunk: DiffHunk,
+	oldRange: { startLine: number; endLine: number } | undefined,
+	newRange: { startLine: number; endLine: number } | undefined,
+): { start: number; end: number } | null {
+	if (!oldRange && !newRange) return null;
+	const lines = hunk.diff.split("\n");
+	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+
+	let oldLine = hunk.oldStart;
+	let newLine = hunk.newStart;
+	let firstMatch: number | null = null;
+	let lastMatch: number | null = null;
+	let bodyIdx = 0;
+
+	for (let i = 0; i < lines.length; i++) {
+		const row = lines[i]!;
+		if (i === 0 && row.startsWith("@@")) continue;
+		if (row.startsWith("\\")) continue;
+		const first = row[0];
+		const kind: " " | "+" | "-" =
+			first === "+" ? "+" : first === "-" ? "-" : " ";
+
+		const inOld =
+			oldRange !== undefined &&
+			(kind === "-" || kind === " ") &&
+			oldLine >= oldRange.startLine &&
+			oldLine <= oldRange.endLine;
+		const inNew =
+			newRange !== undefined &&
+			(kind === "+" || kind === " ") &&
+			newLine >= newRange.startLine &&
+			newLine <= newRange.endLine;
+
+		if (inOld || inNew) {
+			if (firstMatch === null) firstMatch = bodyIdx;
+			lastMatch = bodyIdx;
+		}
+
+		if (kind === " " || kind === "-") oldLine++;
+		if (kind === " " || kind === "+") newLine++;
+		bodyIdx++;
+	}
+
+	if (firstMatch === null || lastMatch === null) return null;
+	return { start: firstMatch, end: lastMatch + 1 };
+}
+
+/**
+ * Counts non-context (`+` / `-`) rows in `hunk`'s body. Used by the
+ * Phase 5 popover to detect "selection consists only of context rows"
+ * and disable the Split action accordingly.
+ */
+export function countDeltaRowsInRange(
+	hunk: DiffHunk,
+	range: { start: number; end: number },
+): number {
+	const lines = hunk.diff.split("\n");
+	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+
+	let bodyIdx = 0;
+	let count = 0;
+	for (let i = 0; i < lines.length; i++) {
+		const row = lines[i]!;
+		if (i === 0 && row.startsWith("@@")) continue;
+		if (row.startsWith("\\")) continue;
+		const first = row[0];
+		if (bodyIdx >= range.start && bodyIdx < range.end) {
+			if (first === "+" || first === "-") count++;
+		}
+		bodyIdx++;
+	}
+	return count;
+}
+
+/**
+ * Total body-row count of `hunk` (excluding the `@@` header and any
+ * `\ No newline` markers).
+ */
+export function countBodyRows(hunk: DiffHunk): number {
+	const lines = hunk.diff.split("\n");
+	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+	let count = 0;
+	for (let i = 0; i < lines.length; i++) {
+		const row = lines[i]!;
+		if (i === 0 && row.startsWith("@@")) continue;
+		if (row.startsWith("\\")) continue;
+		count++;
+	}
+	return count;
+}
+
+/**
+ * Extend a body-row range outward to absorb adjacent blank `+` (Add)
+ * rows. Used by the Phase 5 Split gesture so that a user-drawn split
+ * boundary that lands next to a blank line doesn't leave a 1-row
+ * blank-only sub-hunk behind.
+ *
+ * "Blank Add row" = a body line whose first character is `+` and whose
+ * remaining content is empty or only whitespace. Removed (`-`) and
+ * context (` `) rows do not absorb — they belong to surrounding
+ * sub-hunks naturally via residuals/trim_context.
+ *
+ * Returns a new range `{start, end}` (half-open). If no adjacent blank
+ * rows exist, the range is unchanged.
+ */
+export function expandRangeToAbsorbBlankAddRows(
+	hunk: DiffHunk,
+	range: { start: number; end: number },
+): { start: number; end: number } {
+	const lines = hunk.diff.split("\n");
+	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+
+	// Build a flat array of body rows (skip header and `\ No newline` markers).
+	const bodyRows: string[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		const row = lines[i]!;
+		if (i === 0 && row.startsWith("@@")) continue;
+		if (row.startsWith("\\")) continue;
+		bodyRows.push(row);
+	}
+
+	function isBlankAdd(idx: number): boolean {
+		if (idx < 0 || idx >= bodyRows.length) return false;
+		const row = bodyRows[idx]!;
+		if (row[0] !== "+") return false;
+		return row.slice(1).trim() === "";
+	}
+
+	let { start, end } = range;
+	while (start > 0 && isBlankAdd(start - 1)) start--;
+	while (end < bodyRows.length && isBlankAdd(end)) end++;
+	return { start, end };
+}

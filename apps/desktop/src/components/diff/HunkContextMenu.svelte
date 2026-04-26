@@ -17,7 +17,7 @@
 	import { ANNOTATION_SERVICE } from "$lib/annotations/annotationService.svelte";
 	import { BACKEND } from "$lib/backend";
 	import { getEditorUri, URL_SERVICE } from "$lib/backend/url";
-	import { isDiffHunk, lineIdsToHunkHeaders } from "$lib/hunks/hunk";
+	import { diffToHunkHeaders, isDiffHunk, lineIdsToHunkHeaders } from "$lib/hunks/hunk";
 	import { IRC_API_SERVICE } from "$lib/irc/ircApiService";
 	import { vscodePath } from "$lib/project/project";
 	import { PROJECTS_SERVICE } from "$lib/project/projectsService";
@@ -84,13 +84,24 @@
 		const isWholeFileChange =
 			change.status.type === "Addition" || change.status.type === "Deletion";
 
+		// Re-encode `item.hunk` via `diffToHunkHeaders("discard")` so
+		// sub-hunks (whose synthesized header is not a natural worktree
+		// hunk) get the same null-side encoding the engine expects on the
+		// discard path. For natural hunks this returns headers equivalent
+		// to passing `item.hunk` directly. Without this, discarding a
+		// sub-hunk silently no-ops because the header doesn't match any
+		// real worktree hunk.
+		const hunkHeaders = isWholeFileChange
+			? []
+			: diffToHunkHeaders(item.hunk.diff, "discard");
+
 		await stackService.discardChanges({
 			projectId,
 			worktreeChanges: [
 				{
 					previousPathBytes,
 					pathBytes: change.pathBytes,
-					hunkHeaders: isWholeFileChange ? [] : [item.hunk],
+					hunkHeaders,
 				},
 			],
 		});
