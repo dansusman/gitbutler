@@ -785,9 +785,22 @@ fn migrate_override_multi(
         // them keeps stored ranges sorted, disjoint, and contiguous.
         let mut entries = entries;
         entries.sort_by_key(|(r, _)| r.start);
-        let mut ranges: Vec<RowRange> = entries.iter().map(|(r, _)| *r).collect();
-        ranges.sort_by_key(|r| r.start);
-        ranges.dedup();
+        let mut user_ranges: Vec<RowRange> = entries.iter().map(|(r, _)| *r).collect();
+        user_ranges.sort_by_key(|r| r.start);
+        user_ranges.dedup();
+
+        // Add residual ranges for non-context rows in the new candidate
+        // anchor that aren't covered by any of the migrated user ranges.
+        // Without this step, content that reappeared in the worktree
+        // (e.g. when the user uncommits a partial commit) is left as
+        // "uncovered" rows and silently hidden from the diff view by
+        // `materialize_override` — producing the bug where a 3-section
+        // file post-uncommit displayed only one section's worth of rows.
+        //
+        // `materialize_residual_ranges` expects sorted, disjoint user
+        // ranges and a `kinds` slice of the new anchor's body; it fills
+        // gaps with trimmed-context residuals.
+        let ranges = materialize_residual_ranges(&user_ranges, &c.rows);
         if validate_ranges_stored(&ranges, c.rows.len() as u32).is_err() {
             continue;
         }
@@ -797,6 +810,14 @@ fn migrate_override_multi(
                 assignments_map.insert(r, target);
             }
         }
+        tracing::info!(
+            target: "sub_hunk",
+            path = %ov.path,
+            candidate_anchor = ?c.anchor,
+            user_ranges = ?user_ranges,
+            full_ranges = ?ranges,
+            "migration: residuals re-materialized for new anchor",
+        );
         out.push((
             idx,
             SubHunkOverride {
@@ -1904,6 +1925,93 @@ mod tests {
     /// has only ONE candidate (Section A becomes context with the
     /// surrounding adds in the same hunk). Because content-only matching
     /// would map any blank `+` row to the *first* blank in the new diff,
+    /// Regression for the bug where uncommit re-introduces content
+    /// that the override doesn't cover, and the previously-uncovered
+    /// rows get silently dropped from the rendered diff.
+    ///
+    /// Scenario: user splits a 5-row pure-add hunk into
+    /// [(1,2), (3,4)] (two single-row picks with residual gaps). They
+    /// commit those rows, then uncommit them — the natural hunk grows
+    /// back to 5 rows. The migration must re-emit residual ranges for
+    /// the rows that now exist in the new anchor but weren't in the
+    /// old override's ranges, otherwise `materialize_override` only
+    /// emits sub-hunks for the surviving user picks and the rest is
+    /// hidden.
+    #[test]
+    fn migration_re_introduces_residuals_after_uncommit() {
+        // "Mid-state" anchor (post-commit, pre-uncommit). Only rows 1
+        // and 3 survived the partial commit; rows 0, 2, 4 are now
+        // context (already in HEAD).
+        let mid_anchor = HunkHeader {
+            old_start: 1,
+            old_lines: 3,
+            new_start: 1,
+            new_lines: 5,
+        };
+        let mid_diff = BString::from(
+            "@@ -1,3 +1,5 @@\n\
+             \x20row0\n\
+             +row1\n\
+             \x20row2\n\
+             +row3\n\
+             \x20row4\n",
+        );
+        // Override knows about rows 1 and 3 only (residuals between them
+        // were context and got trimmed at upsert time).
+        let mid_kinds = parse_row_kinds(mid_diff.as_ref());
+        let mid_ranges = materialize_residual_ranges(
+            &[RowRange { start: 1, end: 2 }, RowRange { start: 3, end: 4 }],
+            &mid_kinds,
+        );
+        // Sanity: the context-only gaps should be trimmed away.
+        assert_eq!(
+            mid_ranges,
+            vec![RowRange { start: 1, end: 2 }, RowRange { start: 3, end: 4 }]
+        );
+        let ov = SubHunkOverride {
+            path: BString::from("foo.rs"),
+            anchor: mid_anchor,
+            ranges: mid_ranges,
+            assignments: BTreeMap::new(),
+            rows: mid_kinds,
+            anchor_diff: mid_diff,
+        };
+
+        // Post-uncommit anchor: all 5 rows are added again.
+        let post_anchor = HunkHeader {
+            old_start: 1,
+            old_lines: 0,
+            new_start: 1,
+            new_lines: 5,
+        };
+        let post_diff = BString::from(
+            "@@ -1,0 +1,5 @@\n+row0\n+row1\n+row2\n+row3\n+row4\n",
+        );
+        let mut assignments = vec![nat_assignment("foo.rs", post_anchor, post_diff)];
+
+        let outcomes = apply_overrides_to_assignments(&mut assignments, &[ov]);
+        let migrated = match &outcomes[0] {
+            OverrideOutcome::Migrated(m) => m.clone(),
+            other => panic!("expected Migrated, got {other:?}"),
+        };
+        assert_eq!(migrated.len(), 1);
+        // The user's picks (rows 1 and 3) are present, AND the
+        // newly-reintroduced rows 0, 2, 4 each show up as their own
+        // residual sub-hunk so the diff view doesn't lose them.
+        assert_eq!(
+            migrated[0].ranges,
+            vec![
+                RowRange { start: 0, end: 1 },
+                RowRange { start: 1, end: 2 },
+                RowRange { start: 2, end: 3 },
+                RowRange { start: 3, end: 4 },
+                RowRange { start: 4, end: 5 },
+            ],
+            "residuals must be re-materialized so uncommitted rows aren't \
+             silently hidden by `materialize_override`",
+        );
+    }
+
     /// the original implementation collapsed range (9, 19) onto
     /// `[1, 19)` — overlapping range (0, 5)'s remap of `[0, 4)` and
     /// failing `validate_ranges_stored`. The order-preserving alignment
@@ -1955,6 +2063,11 @@ mod tests {
             new_start: 1,
             new_lines: 19,
         };
+        // Note: leading-space context-line markers must be encoded
+        // explicitly (\x20) here because Rust's `\` line-continuation
+        // syntax eats whitespace at the start of the next physical
+        // source line. Without this, ` - alpha line one` would lose its
+        // leading space and parse as a remove row.
         let post_diff = BString::from(
             "@@ -1,4 +1,19 @@\n\
              +# Split Test\n\
@@ -1962,10 +2075,10 @@ mod tests {
              +This whole file\n\
              +pure-add hunk\n\
              +\n\
-              ## Section A\n\
-              - alpha line one\n\
-              - alpha line two\n\
-              - alpha line three\n\
+             \x20## Section A\n\
+             \x20- alpha line one\n\
+             \x20- alpha line two\n\
+             \x20- alpha line three\n\
              +\n\
              +## Section B\n\
              +- beta line one\n\
