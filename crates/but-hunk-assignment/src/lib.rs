@@ -11,6 +11,12 @@
 
 mod reconcile;
 mod state;
+pub mod sub_hunk;
+
+pub use sub_hunk::{
+    RowRange, SubHunkOverride, drop_overrides, list_overrides, reconcile_with_overrides,
+    remove_override, upsert_override,
+};
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -422,6 +428,7 @@ pub fn assign(
             diff.ok().flatten(),
         ));
     }
+    sub_hunk::reconcile_with_overrides(repo.git_dir(), &mut worktree_assignments);
 
     // Reconcile worktree with the persisted assignments
     let mut persisted_assignments = state::assignments(db.to_ref())?;
@@ -490,6 +497,7 @@ fn reconcile_worktree_changes_with_worktree(
             diff.ok().flatten(),
         ));
     }
+    sub_hunk::reconcile_with_overrides(repo.git_dir(), &mut worktree_assignments);
     let mut reconciled = reconcile_with_worktree(db.to_ref(), workspace, &worktree_assignments)?;
 
     derive_stack_ids(&mut reconciled, workspace);

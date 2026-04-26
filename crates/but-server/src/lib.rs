@@ -776,6 +776,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             but_post(diff::changes_in_worktree_cmd),
         )
         .route("/assign_hunk", but_post(diff::assign_hunk_cmd))
+        .route("/split_hunk", but_post(diff::split_hunk_cmd))
+        .route("/unsplit_hunk", but_post(diff::unsplit_hunk_cmd))
         .route(
             "/cherry_apply_status",
             but_post(legacy::cherry_apply::cherry_apply_status_cmd),

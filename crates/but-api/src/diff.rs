@@ -1,7 +1,11 @@
+use std::collections::BTreeMap;
+
+use anyhow::{Context as _, anyhow, bail};
+use bstr::BString;
 use but_api_macros::but_api;
-use but_core::{sync::RepoExclusive, ui::TreeChange};
+use but_core::{HunkHeader, sync::RepoExclusive, ui::TreeChange};
 use but_ctx::Context;
-use but_hunk_assignment::{HunkAssignmentRequest, WorktreeChanges};
+use but_hunk_assignment::{HunkAssignmentRequest, RowRange, SubHunkOverride, WorktreeChanges};
 use but_hunk_dependency::ui::hunk_dependencies_for_workspace_changes_by_worktree_dir;
 use but_oplog::legacy::{OperationKind, SnapshotDetails};
 use gix::prelude::ObjectIdExt;
@@ -252,3 +256,136 @@ pub fn assign_hunk_with_perm(
     }
     res
 }
+
+/// Split the natural hunk identified by `(path, anchor)` into sub-hunks at the
+/// row boundaries described by `ranges`.
+///
+/// `ranges` are 0-based, half-open row indices into the anchor hunk's diff
+/// body (excluding the `@@` header line). Leading and trailing context rows
+/// are silently trimmed from each range before validation. After trimming,
+/// the request must satisfy:
+///
+/// - at least one non-empty range,
+/// - ranges sorted, disjoint, and contained within the anchor's row count,
+/// - ranges do not collectively cover every row in the anchor.
+///
+/// The override is stored in process memory only (see
+/// [`but_hunk_assignment::sub_hunk`]); it is dropped on app relaunch and on
+/// the next reconcile pass that fails to find a natural hunk with this exact
+/// anchor (e.g. after the user edits the file). Reassigning the resulting
+/// sub-hunks to other stacks goes through the regular `assign_hunk` flow.
+#[but_api(napi)]
+#[instrument(skip_all, err(Debug))]
+pub fn split_hunk(
+    ctx: &mut Context,
+    path: BString,
+    anchor: HunkHeader,
+    ranges: Vec<RowRange>,
+) -> anyhow::Result<()> {
+    let mut guard = ctx.exclusive_worktree_access();
+    split_hunk_with_perm(ctx, path, anchor, ranges, guard.write_permission())
+}
+
+/// Implementation of [`split_hunk`] that runs under caller-held exclusive
+/// repository access. Useful for callers that already hold the lock.
+pub fn split_hunk_with_perm(
+    ctx: &mut Context,
+    path: BString,
+    anchor: HunkHeader,
+    ranges: Vec<RowRange>,
+    perm: &mut RepoExclusive,
+) -> anyhow::Result<()> {
+    let context_lines = ctx.settings.context_lines;
+    let gitdir = ctx.gitdir.clone();
+    let (repo, ws, mut db) = ctx.workspace_mut_and_db_mut_with_perm(perm)?;
+
+    // Find the natural hunk matching (path, anchor) and recover its row body.
+    let changes = but_core::diff::worktree_changes(&repo)?.changes;
+    let change = changes
+        .iter()
+        .find(|c| c.path == path)
+        .ok_or_else(|| anyhow!("path {} not present in worktree changes", path))?;
+    let patch = change
+        .unified_patch(&repo, context_lines)?
+        .ok_or_else(|| anyhow!("path {} has no unified patch", path))?;
+    let hunks = match patch {
+        but_core::UnifiedPatch::Patch { hunks, .. } => hunks,
+        _ => bail!("path {} is not a textual patch", path),
+    };
+    let hunk = hunks
+        .iter()
+        .find(|h| HunkHeader::from(*h) == anchor)
+        .ok_or_else(|| anyhow!("anchor hunk not found in current worktree diff"))?;
+    let kinds = but_hunk_assignment::sub_hunk::parse_row_kinds(hunk.diff.as_ref());
+    let row_count = kinds.len() as u32;
+
+    let trimmed: Vec<RowRange> = ranges
+        .into_iter()
+        .filter_map(|r| but_hunk_assignment::sub_hunk::trim_context(r, &kinds))
+        .collect();
+    but_hunk_assignment::sub_hunk::validate_ranges(&trimmed, row_count)
+        .with_context(|| "invalid split request")?;
+
+    but_hunk_assignment::upsert_override(
+        &gitdir,
+        SubHunkOverride {
+            path: path.clone(),
+            anchor,
+            ranges: trimmed,
+            assignments: BTreeMap::new(),
+        },
+    );
+
+    // Trigger a reconcile so the persisted assignments and downstream consumers
+    // see the materialized sub-hunks.
+    but_hunk_assignment::assignments_with_fallback(
+        db.hunk_assignments_mut()?,
+        &repo,
+        &ws,
+        Some(changes),
+        context_lines,
+    )?;
+    Ok(())
+}
+
+/// Reverse a previous [`split_hunk`] for `(path, anchor)`. Materialized
+/// sub-hunks reabsorb into the natural anchor on the next reconcile.
+///
+/// Per-sub-hunk reassignments to other stacks are dropped (the merged hunk
+/// reverts to the anchor's pre-split assignment). The frontend is responsible
+/// for surfacing a confirmation prompt before calling this when a
+/// reassignment would be lost.
+#[but_api(napi)]
+#[instrument(skip_all, err(Debug))]
+pub fn unsplit_hunk(
+    ctx: &mut Context,
+    path: BString,
+    anchor: HunkHeader,
+) -> anyhow::Result<()> {
+    let mut guard = ctx.exclusive_worktree_access();
+    unsplit_hunk_with_perm(ctx, path, anchor, guard.write_permission())
+}
+
+/// Implementation of [`unsplit_hunk`] that runs under caller-held exclusive
+/// repository access.
+pub fn unsplit_hunk_with_perm(
+    ctx: &mut Context,
+    path: BString,
+    anchor: HunkHeader,
+    perm: &mut RepoExclusive,
+) -> anyhow::Result<()> {
+    let context_lines = ctx.settings.context_lines;
+    let gitdir = ctx.gitdir.clone();
+    let _removed = but_hunk_assignment::remove_override(&gitdir, &path, anchor);
+
+    let (repo, ws, mut db) = ctx.workspace_mut_and_db_mut_with_perm(perm)?;
+    but_hunk_assignment::assignments_with_fallback(
+        db.hunk_assignments_mut()?,
+        &repo,
+        &ws,
+        None::<Vec<but_core::TreeChange>>,
+        context_lines,
+    )?;
+    Ok(())
+}
+
