@@ -791,6 +791,7 @@ mod tests {
                     line_nums_added: None,
                     line_nums_removed: None,
                     diff: None,
+                sub_hunk_origin: None,
                 },
                 cli_id: path.to_owned(),
             }],

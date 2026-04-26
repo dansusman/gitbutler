@@ -63,6 +63,25 @@ pub enum RowKind {
     Remove,
 }
 
+/// In-memory provenance attached to a sub-hunk `HunkAssignment` so that the
+/// commit pipeline can re-encode the sub-range using the engine-native
+/// null-side encoding (see [`encode_sub_hunk_for_commit`]).
+///
+/// Populated by [`materialize_override`] and intentionally `#[serde(skip)]`
+/// on `HunkAssignment` — sub-hunks are never persisted as such; the override
+/// store is rebuilt in memory and the origin is recomputed on each reconcile.
+#[derive(Debug, Clone)]
+pub struct SubHunkOrigin {
+    /// The natural worktree hunk this sub-hunk was carved out of.
+    pub anchor: HunkHeader,
+    /// The row range within the anchor's diff body that this sub-hunk
+    /// represents.
+    pub range: RowRange,
+    /// The parsed row kinds of the *whole* anchor body. Carried so commit
+    /// encoding can resolve absolute line numbers without re-parsing.
+    pub rows: Vec<RowKind>,
+}
+
 /// A user-issued sub-hunk split, keyed by `(path, anchor)`.
 ///
 /// `ranges` are the user-carved sub-ranges. Rows of the anchor not covered by
@@ -232,6 +251,83 @@ pub fn sub_diff_body(anchor_diff: &[u8], range: RowRange) -> BString {
     BString::from(out)
 }
 
+/// Encode a sub-range as `HunkHeader`s in the form the commit engine
+/// expects (see `but_core::tree::to_additive_hunks`): contiguous runs of
+/// `+` rows become `(-0,0 +new_start,count)` headers and contiguous runs
+/// of `-` rows become `(-old_start,count +0,0)` headers. Context rows
+/// inside the range are skipped (they aren't being added or removed).
+///
+/// `rows` is the parsed row sequence of the anchor's *full* diff body
+/// (see [`parse_row_kinds`]); `range` indexes into it.
+///
+/// For a pure-add sub-range this returns one header; for pure-remove, one;
+/// for a mixed sub-range with K alternating runs, K headers.
+pub fn encode_sub_hunk_for_commit(
+    anchor: HunkHeader,
+    range: RowRange,
+    rows: &[RowKind],
+) -> Vec<HunkHeader> {
+    let row_count = rows.len();
+    let start = (range.start as usize).min(row_count);
+    let end = (range.end as usize).min(row_count);
+
+    let mut new_line = anchor.new_start;
+    let mut old_line = anchor.old_start;
+    for k in &rows[..start] {
+        match k {
+            RowKind::Context => {
+                new_line += 1;
+                old_line += 1;
+            }
+            RowKind::Add => new_line += 1,
+            RowKind::Remove => old_line += 1,
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut i = start;
+    while i < end {
+        match rows[i] {
+            RowKind::Add => {
+                let run_start = new_line;
+                let mut count = 0u32;
+                while i < end && matches!(rows[i], RowKind::Add) {
+                    count += 1;
+                    new_line += 1;
+                    i += 1;
+                }
+                out.push(HunkHeader {
+                    old_start: 0,
+                    old_lines: 0,
+                    new_start: run_start,
+                    new_lines: count,
+                });
+            }
+            RowKind::Remove => {
+                let run_start = old_line;
+                let mut count = 0u32;
+                while i < end && matches!(rows[i], RowKind::Remove) {
+                    count += 1;
+                    old_line += 1;
+                    i += 1;
+                }
+                out.push(HunkHeader {
+                    old_start: run_start,
+                    old_lines: count,
+                    new_start: 0,
+                    new_lines: 0,
+                });
+            }
+            RowKind::Context => {
+                old_line += 1;
+                new_line += 1;
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Apply a single override to a single anchor `HunkAssignment`.
 ///
 /// Returns the materialized sub-hunk assignments. If the anchor lacks a
@@ -294,6 +390,11 @@ fn materialize_override(
                 line_nums_added: None,
                 line_nums_removed: None,
                 diff: Some(sub_diff_body(diff, range)),
+                sub_hunk_origin: Some(SubHunkOrigin {
+                    anchor: anchor_header,
+                    range,
+                    rows: kinds.clone(),
+                }),
             }
         })
         .collect()
@@ -561,6 +662,7 @@ mod tests {
             line_nums_added: None,
             line_nums_removed: None,
             diff: Some(sample_diff()),
+            sub_hunk_origin: None,
         }
     }
 
@@ -635,6 +737,135 @@ mod tests {
             .collect();
         assert_eq!(on_feature.len(), 1, "middle sub-hunk on override branch");
         assert_eq!(on_main.len(), 2, "residuals on anchor branch");
+    }
+
+    #[test]
+    fn encode_pure_add_at_start() {
+        // Body: +a +a ctx ctx, anchor -100,2 +100,4.
+        let rows = vec![RowKind::Add, RowKind::Add, RowKind::Context, RowKind::Context];
+        let anchor = HunkHeader {
+            old_start: 100,
+            old_lines: 2,
+            new_start: 100,
+            new_lines: 4,
+        };
+        let headers = encode_sub_hunk_for_commit(anchor, RowRange { start: 0, end: 2 }, &rows);
+        assert_eq!(
+            headers,
+            vec![HunkHeader { old_start: 0, old_lines: 0, new_start: 100, new_lines: 2 }]
+        );
+    }
+
+    #[test]
+    fn encode_pure_remove_at_end() {
+        // Body: ctx ctx -r -r, anchor -50,4 +50,2.
+        let rows = vec![RowKind::Context, RowKind::Context, RowKind::Remove, RowKind::Remove];
+        let anchor = HunkHeader {
+            old_start: 50,
+            old_lines: 4,
+            new_start: 50,
+            new_lines: 2,
+        };
+        let headers = encode_sub_hunk_for_commit(anchor, RowRange { start: 2, end: 4 }, &rows);
+        assert_eq!(
+            headers,
+            vec![HunkHeader { old_start: 52, old_lines: 2, new_start: 0, new_lines: 0 }]
+        );
+    }
+
+    #[test]
+    fn encode_mixed_emits_two_headers() {
+        // Body: ctx -r +a -r +a ctx, anchor -10,5 +10,5.
+        // Range rows 1..5 covers -r +a -r +a.
+        let rows = parse_row_kinds(sample_diff().as_ref());
+        let headers = encode_sub_hunk_for_commit(anchor(), RowRange { start: 1, end: 5 }, &rows);
+        // Walk: starting at row 1, new_line=11, old_line=11 (after row 0 ctx).
+        // -r => (-11,1 +0,0); new_line stays 11, old_line=12
+        // +a => (-0,0 +11,1); new_line=12
+        // -r => (-12,1 +0,0); old_line=13
+        // +a => (-0,0 +12,1); new_line=13
+        assert_eq!(
+            headers,
+            vec![
+                HunkHeader { old_start: 11, old_lines: 1, new_start: 0, new_lines: 0 },
+                HunkHeader { old_start: 0, old_lines: 0, new_start: 11, new_lines: 1 },
+                HunkHeader { old_start: 12, old_lines: 1, new_start: 0, new_lines: 0 },
+                HunkHeader { old_start: 0, old_lines: 0, new_start: 12, new_lines: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn encode_collapses_contiguous_runs() {
+        // Body: +a +a +a, anchor -1,0 +1,3.
+        let rows = vec![RowKind::Add, RowKind::Add, RowKind::Add];
+        let anchor = HunkHeader {
+            old_start: 1,
+            old_lines: 0,
+            new_start: 1,
+            new_lines: 3,
+        };
+        let headers = encode_sub_hunk_for_commit(anchor, RowRange { start: 0, end: 3 }, &rows);
+        assert_eq!(
+            headers,
+            vec![HunkHeader { old_start: 0, old_lines: 0, new_start: 1, new_lines: 3 }]
+        );
+    }
+
+    #[test]
+    fn encode_skips_internal_context() {
+        // Body: +a ctx +a, anchor -1,1 +1,3.
+        let rows = vec![RowKind::Add, RowKind::Context, RowKind::Add];
+        let anchor = HunkHeader {
+            old_start: 1,
+            old_lines: 1,
+            new_start: 1,
+            new_lines: 3,
+        };
+        let headers = encode_sub_hunk_for_commit(anchor, RowRange { start: 0, end: 3 }, &rows);
+        // First add at new_line=1, then ctx advances to 2, then add at new_line=2.
+        assert_eq!(
+            headers,
+            vec![
+                HunkHeader { old_start: 0, old_lines: 0, new_start: 1, new_lines: 1 },
+                HunkHeader { old_start: 0, old_lines: 0, new_start: 3, new_lines: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn encode_single_row_range() {
+        let rows = parse_row_kinds(sample_diff().as_ref());
+        // Row 2 is +a (after ctx, -r). new_line=11.
+        let headers = encode_sub_hunk_for_commit(anchor(), RowRange { start: 2, end: 3 }, &rows);
+        assert_eq!(
+            headers,
+            vec![HunkHeader { old_start: 0, old_lines: 0, new_start: 11, new_lines: 1 }]
+        );
+    }
+
+    #[test]
+    fn encode_with_leading_context_in_range() {
+        // Body: ctx -r ctx +a, range 0..4 (deliberately includes leading
+        // context to verify the encoder skips it without consuming line
+        // numbers from the run output). Anchor -1,2 +1,2.
+        let rows = vec![RowKind::Context, RowKind::Remove, RowKind::Context, RowKind::Add];
+        let anchor = HunkHeader {
+            old_start: 1,
+            old_lines: 2,
+            new_start: 1,
+            new_lines: 2,
+        };
+        let headers = encode_sub_hunk_for_commit(anchor, RowRange { start: 0, end: 4 }, &rows);
+        // ctx: old=2,new=2. -r at old=2 => (-2,1 +0,0); old=3.
+        // ctx: old=4,new=3. +a at new=3 => (-0,0 +3,1).
+        assert_eq!(
+            headers,
+            vec![
+                HunkHeader { old_start: 2, old_lines: 1, new_start: 0, new_lines: 0 },
+                HunkHeader { old_start: 0, old_lines: 0, new_start: 3, new_lines: 1 },
+            ]
+        );
     }
 
     #[test]

@@ -14,8 +14,8 @@ mod state;
 pub mod sub_hunk;
 
 pub use sub_hunk::{
-    RowRange, SubHunkOverride, drop_overrides, list_overrides, reconcile_with_overrides,
-    remove_override, upsert_override,
+    RowRange, SubHunkOrigin, SubHunkOverride, drop_overrides, encode_sub_hunk_for_commit,
+    list_overrides, reconcile_with_overrides, remove_override, upsert_override,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -73,6 +73,12 @@ pub struct HunkAssignment {
     /// The hunk diff for internal usage. This is not to be persisted or sent over the API.
     #[serde(skip)]
     pub diff: Option<BString>,
+    /// In-memory provenance for sub-hunks materialized from a `SubHunkOverride`.
+    /// Always `None` for natural worktree hunks. `#[serde(skip)]` because
+    /// sub-hunk overrides are never persisted; the field is repopulated on
+    /// every reconcile by `sub_hunk::reconcile_with_overrides`.
+    #[serde(skip)]
+    pub sub_hunk_origin: Option<SubHunkOrigin>,
 }
 #[cfg(feature = "export-schema")]
 but_schemars::register_sdk_type!(HunkAssignment);
@@ -109,6 +115,7 @@ impl TryFrom<but_db::HunkAssignment> for HunkAssignment {
             line_nums_added: None,   // derived data (not persisted)
             line_nums_removed: None, // derived data (not persisted)
             diff: None,              // derived data (not persisted)
+            sub_hunk_origin: None,   // derived data (not persisted)
         })
     }
 }
@@ -136,7 +143,12 @@ impl TryFrom<HunkAssignment> for but_db::HunkAssignment {
 
 impl From<HunkAssignment> for but_core::DiffSpec {
     fn from(value: HunkAssignment) -> Self {
-        let hunk_headers = if let Some(header) = value.hunk_header {
+        let hunk_headers = if let Some(origin) = value.sub_hunk_origin.as_ref() {
+            // Sub-hunk: re-encode the row range using the engine-native
+            // null-side form so the commit pipeline matches it against the
+            // anchor in the worktree diff.
+            sub_hunk::encode_sub_hunk_for_commit(origin.anchor, origin.range, &origin.rows)
+        } else if let Some(header) = value.hunk_header {
             vec![but_core::HunkHeader {
                 old_start: header.old_start,
                 old_lines: header.old_lines,
@@ -605,6 +617,7 @@ fn diff_to_assignments(diff: Option<UnifiedPatch>, path: BString) -> Vec<HunkAss
                 line_nums_added: None,
                 line_nums_removed: None,
                 diff: None,
+                sub_hunk_origin: None,
             }],
             but_core::UnifiedPatch::TooLarge { .. } => vec![HunkAssignment {
                 id: Some(Uuid::new_v4()),
@@ -616,6 +629,7 @@ fn diff_to_assignments(diff: Option<UnifiedPatch>, path: BString) -> Vec<HunkAss
                 line_nums_added: None,
                 line_nums_removed: None,
                 diff: None,
+                sub_hunk_origin: None,
             }],
             but_core::UnifiedPatch::Patch {
                 hunks,
@@ -634,6 +648,7 @@ fn diff_to_assignments(diff: Option<UnifiedPatch>, path: BString) -> Vec<HunkAss
                         line_nums_added: None,
                         line_nums_removed: None,
                         diff: None,
+                        sub_hunk_origin: None,
                     }]
                 } else {
                     hunks
@@ -651,6 +666,7 @@ fn diff_to_assignments(diff: Option<UnifiedPatch>, path: BString) -> Vec<HunkAss
                                 line_nums_added: Some(line_nums_added_new),
                                 line_nums_removed: Some(line_nums_removed_old),
                                 diff: Some(hunk.diff.clone()),
+                                sub_hunk_origin: None,
                             }
                         })
                         .collect()
@@ -668,6 +684,7 @@ fn diff_to_assignments(diff: Option<UnifiedPatch>, path: BString) -> Vec<HunkAss
             line_nums_added: None,
             line_nums_removed: None,
             diff: None,
+            sub_hunk_origin: None,
         }]
     }
 }
@@ -759,6 +776,7 @@ fn requests_to_assignments(
             line_nums_added: None,
             line_nums_removed: None,
             diff: None,
+            sub_hunk_origin: None,
         };
         assignments.push(assignment);
     }
@@ -807,7 +825,13 @@ pub fn convert_assignments_to_diff_specs(
     for (path, hunks) in specs_by_path {
         let mut hunk_headers = Vec::new();
         for hunk in hunks {
-            if let Some(header) = hunk.hunk_header {
+            if let Some(origin) = hunk.sub_hunk_origin.as_ref() {
+                hunk_headers.extend(sub_hunk::encode_sub_hunk_for_commit(
+                    origin.anchor,
+                    origin.range,
+                    &origin.rows,
+                ));
+            } else if let Some(header) = hunk.hunk_header {
                 hunk_headers.push(header);
             }
         }
@@ -885,6 +909,7 @@ mod tests {
                 line_nums_added: None,
                 line_nums_removed: None,
                 diff: None,
+            sub_hunk_origin: None,
             }
         }
 
@@ -1261,6 +1286,7 @@ mod tests {
             line_nums_added: None,
             line_nums_removed: None,
             diff: None,
+        sub_hunk_origin: None,
         };
 
         let binary2 = HunkAssignment {
@@ -1273,6 +1299,7 @@ mod tests {
             line_nums_added: None,
             line_nums_removed: None,
             diff: None,
+        sub_hunk_origin: None,
         };
 
         assert!(
@@ -1300,6 +1327,7 @@ mod tests {
             line_nums_added: None,
             line_nums_removed: None,
             diff: None,
+        sub_hunk_origin: None,
         };
 
         assert!(
@@ -1325,6 +1353,7 @@ mod tests {
             line_nums_added: None,
             line_nums_removed: None,
             diff: None,
+        sub_hunk_origin: None,
         };
 
         let binary2 = HunkAssignment {
@@ -1337,6 +1366,7 @@ mod tests {
             line_nums_added: None,
             line_nums_removed: None,
             diff: None,
+        sub_hunk_origin: None,
         };
 
         assert!(
@@ -1360,6 +1390,7 @@ mod tests {
                 line_nums_added: None,
                 line_nums_removed: None,
                 diff: None,
+            sub_hunk_origin: None,
             },
             // Text file assigned to stack 1
             HunkAssignment::new("code.rs", 10, 5, Some(1), Some(2)),
@@ -1377,6 +1408,7 @@ mod tests {
                 line_nums_added: None,
                 line_nums_removed: None,
                 diff: None,
+            sub_hunk_origin: None,
             },
             // Same text file, modified
             HunkAssignment::new("code.rs", 10, 7, None, Some(4)),
@@ -1422,6 +1454,7 @@ mod tests {
             line_nums_added: None,
             line_nums_removed: None,
             diff: None,
+        sub_hunk_origin: None,
         }];
 
         let result = reconcile::assignments(
@@ -1549,6 +1582,110 @@ mod tests {
         assert_eq!(
             result[0].branch_ref_bytes, None,
             "branch_ref_bytes should be cleared when branch is no longer in workspace"
+        );
+    }
+
+    #[test]
+    fn diffspec_from_natural_hunk_emits_single_header() {
+        let assignment = HunkAssignment::new("foo.rs", 10, 5, None, None);
+        let spec: DiffSpec = assignment.clone().into();
+        assert_eq!(spec.path, BString::from("foo.rs"));
+        assert_eq!(
+            spec.hunk_headers,
+            vec![HunkHeader {
+                old_start: 10,
+                old_lines: 5,
+                new_start: 10,
+                new_lines: 5,
+            }]
+        );
+    }
+
+    #[test]
+    fn diffspec_from_sub_hunk_emits_null_side_encoding() {
+        // Anchor body: ctx -r +a -r +a ctx, anchor -10,5 +10,5.
+        // Sub-range rows 1..3 (-r +a) on path foo.rs.
+        let anchor = HunkHeader {
+            old_start: 10,
+            old_lines: 5,
+            new_start: 10,
+            new_lines: 5,
+        };
+        let rows = vec![
+            sub_hunk::RowKind::Context,
+            sub_hunk::RowKind::Remove,
+            sub_hunk::RowKind::Add,
+            sub_hunk::RowKind::Remove,
+            sub_hunk::RowKind::Add,
+            sub_hunk::RowKind::Context,
+        ];
+        let range = RowRange { start: 1, end: 3 };
+        let mut assignment = HunkAssignment::new("foo.rs", 11, 1, None, None);
+        // The synthesized header on the assignment is unused once
+        // sub_hunk_origin is populated; what matters is the encode_* output.
+        assignment.sub_hunk_origin = Some(SubHunkOrigin {
+            anchor,
+            range,
+            rows,
+        });
+
+        let spec: DiffSpec = assignment.into();
+        assert_eq!(
+            spec.hunk_headers,
+            vec![
+                HunkHeader {
+                    old_start: 11,
+                    old_lines: 1,
+                    new_start: 0,
+                    new_lines: 0,
+                },
+                HunkHeader {
+                    old_start: 0,
+                    old_lines: 0,
+                    new_start: 11,
+                    new_lines: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn convert_assignments_to_diff_specs_groups_sub_hunks_by_path() {
+        // Two sub-hunks of the same anchor on the same path should produce
+        // a single DiffSpec with the union of their encoded headers.
+        let anchor = HunkHeader {
+            old_start: 1,
+            old_lines: 0,
+            new_start: 1,
+            new_lines: 4,
+        };
+        let rows = vec![
+            sub_hunk::RowKind::Add,
+            sub_hunk::RowKind::Add,
+            sub_hunk::RowKind::Add,
+            sub_hunk::RowKind::Add,
+        ];
+        let mut a = HunkAssignment::new("foo.rs", 1, 1, None, None);
+        a.sub_hunk_origin = Some(SubHunkOrigin {
+            anchor,
+            range: RowRange { start: 0, end: 1 },
+            rows: rows.clone(),
+        });
+        let mut b = HunkAssignment::new("foo.rs", 1, 1, None, None);
+        b.sub_hunk_origin = Some(SubHunkOrigin {
+            anchor,
+            range: RowRange { start: 3, end: 4 },
+            rows,
+        });
+
+        let specs = convert_assignments_to_diff_specs(&[a, b]).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].hunk_headers,
+            vec![
+                HunkHeader { old_start: 0, old_lines: 0, new_start: 1, new_lines: 1 },
+                HunkHeader { old_start: 0, old_lines: 0, new_start: 4, new_lines: 1 },
+            ]
         );
     }
 }
