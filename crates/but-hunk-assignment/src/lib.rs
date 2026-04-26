@@ -14,9 +14,14 @@ mod state;
 pub mod sub_hunk;
 
 pub use sub_hunk::{
-    RowRange, SubHunkOrigin, SubHunkOverride, drop_overrides, encode_sub_hunk_for_commit,
-    get_override, list_overrides, merge_user_ranges_into_partition,
-    reconcile_with_overrides, remove_override, upsert_override,
+    MAX_OVERRIDE_DB_BYTES, OVERRIDE_DB_SCHEMA_VERSION, RowRange, SubHunkOrigin,
+    SubHunkOverride, drop_overrides, drop_overrides_persistent,
+    encode_sub_hunk_for_commit, ensure_hydrated, from_db_row, get_override,
+    hydrate_from_db,
+    list_overrides, merge_user_ranges_into_partition, reconcile_with_overrides,
+    reconcile_with_overrides_persistent, remove_override,
+    remove_override_persistent, to_db_row, upsert_override,
+    upsert_override_persistent,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -276,7 +281,7 @@ pub struct JsonAbsorbOutput {
 }
 
 /// The target for a hunk assignment request.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(
     rename_all = "camelCase",

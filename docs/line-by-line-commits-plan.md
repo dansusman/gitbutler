@@ -23,8 +23,12 @@ Last updated: end of "phase 5 polish + sub-hunk re-split + 6.5a" session.
 | 5d — Single-tap opens popover + sub-hunk re-split (merge into existing override) | **Shipped (this session)** | _pending_ |
 | 5e — Polish: blank-`+` row absorption in Split gesture; sub-hunk discard re-encoding | **Shipped (this session)** | _pending_ |
 | 6 — Polish (hunk-dep on sub-hunks, storybook, etc.) | Not started | — |
-| 6.5a — Serde-fy `SubHunkOverride` (in-memory round-trip) | **Shipped (this session)** | _pending_ |
-| 6.5b–e — `but-db` schema, hydration, write-through, size guards | Not started — next | — |
+| 6.5a — Serde-fy `SubHunkOverride` (in-memory round-trip) | **Shipped** | _pending_ |
+| 6.5b — `but-db` `sub_hunk_overrides` schema + CRUD | **Shipped** | _pending_ |
+| 6.5c — Hydration on-demand (`ensure_hydrated`) + bridge (`to_db_row` / `from_db_row`) | **Shipped (this session)** | _pending_ |
+| 6.5d — Write-through on `split_hunk` / `unsplit_hunk` + read-path hydration in `changes_in_worktree_with_perm` | **Shipped (this session)** | _pending_ |
+| 6.5e — Size guard (`MAX_OVERRIDE_DB_BYTES = 64 KB`) | **Shipped (this session)** | _pending_ |
+| 6.5d-followup — Wire `reconcile_with_overrides_persistent` into `assignments_with_fallback` / `assign` (write-through on partial-commit migration / drops) | Not started | — |
 | **7 — Splitting committed work + cross-stack moves of split pieces** | **Not started — critical for downstream workflow** | — |
 | **⚠ Open: partial-commit content duplication on pure-add sub-hunks** | **Investigating** | — |
 
@@ -856,3 +860,211 @@ diagnosis I didn't complete.
 - After a raw `invoke()`, the GUI doesn't auto-refresh because RTK's
   `invalidatesTags` only fires through the redux mutation. Touch any
   file in the project to nudge the watcher and force a refetch.
+
+## What landed in the phase 6.5b session
+
+### Phase 6.5b — `but-db` `sub_hunk_overrides` schema + CRUD (shipped)
+
+- **Migration.** New file
+  `crates/but-db/src/table/sub_hunk_overrides.rs` containing a single
+  `M::up(20260424120000, SchemaVersion::Zero, ...)` that creates the
+  `sub_hunk_overrides` table with the columns the plan calls for:
+  `gitdir TEXT`, `path BLOB`, four `anchor_*` integers, three
+  JSON-encoded text columns (`ranges_json`, `assignments_json`,
+  `rows_json`), the cached `anchor_diff` blob, and a
+  `schema_version` integer. Primary key spans `(gitdir, path,
+  anchor_old_start, anchor_old_lines, anchor_new_start,
+  anchor_new_lines)` to match the in-memory key shape exactly.
+  Registered in `crates/but-db/src/table/mod.rs` and the `MIGRATIONS`
+  array in `crates/but-db/src/lib.rs`.
+- **Row type and handles.** Public `SubHunkOverrideRow` plus
+  `SubHunkOverridesHandle` / `SubHunkOverridesHandleMut` wrappers
+  exposed from `but_db`. Read API: `list_all`, `list_for_gitdir`,
+  `get`. Write API: `upsert` (single-statement `ON CONFLICT … DO
+  UPDATE`), `delete`, `delete_for_gitdir`. The crate intentionally
+  treats the JSON columns as opaque strings — `but-hunk-assignment`
+  will own the serde<→`SubHunkOverride` bridge in 6.5c, which keeps
+  `but-db` from depending on `but-hunk-assignment` (only the inverse
+  edge already exists).
+- **Tests.** 11 new integration tests in
+  `crates/but-db/tests/db/table/sub_hunk_overrides.rs` covering empty
+  list, upsert+get round-trip, upsert-replaces-existing, list filter
+  by `gitdir`, primary-key disambiguation between two rows that
+  differ only on `anchor_old_lines`, single-row delete, no-op delete
+  of a missing row, `delete_for_gitdir` scoping, byte-exact blob
+  round-trip (path with embedded NUL/`\xff`, `anchor_diff` carrying
+  every `u8`), and transaction commit/rollback.
+- **Snapshot updates.** `crates/but-db/tests/db/migration.rs`'s
+  `run_ours` schema dump and migration-list dump updated for the new
+  table and the `20260424120000` migration version.
+
+### What's next (6.5c–e)
+
+6.5c hydration: on `Context` open, read every override row for the
+project's `gitdir` via `SubHunkOverridesHandle::list_for_gitdir`,
+deserialize each row's three JSON columns + the four anchor integers
++ `anchor_diff` into a `SubHunkOverride`, and call
+`upsert_override(gitdir, ov)` for each. Then run
+`reconcile_with_overrides(gitdir, &mut assignments)` once against the
+current worktree so any anchors that no longer match are dropped (and
+the `delete` write-through from 6.5d removes them from disk).
+
+6.5d write-through: each of `upsert_override`, `remove_override`,
+`drop_overrides`, and `migrate_stored_override_multi` in
+`crates/but-hunk-assignment/src/sub_hunk.rs` needs a paired DB call.
+The cleanest route is a small helper that takes `&Context` (or just
+`&DbHandle`) and the same `(path, anchor)` key, so the in-memory and
+disk mutations can't drift. This is also where the
+`SubHunkOverride` ↔ `SubHunkOverrideRow` bridge lives:
+- `ranges_json = serde_json::to_string(&ov.ranges)?`
+- `assignments_json = serde_json::to_string(&ov.assignments)?`
+  (note: the field already uses the `assignments_pairs` serde
+  helper that emits a JSON array of `[range, target]` pairs, so
+  this just calls into that)
+- `rows_json = serde_json::to_string(&ov.rows)?`
+- `anchor_diff = ov.anchor_diff.to_vec()`
+- four anchor integers from `ov.anchor`
+- `schema_version = 1`
+
+6.5e size guards: refuse to persist (and drop the override) if
+`anchor_diff.len() + rows_json.len() > 64 KB`. Surface as a single
+`tracing::warn!`. Plus a crash-recovery test: write an override,
+simulate process death between `upsert_override` and
+`reconcile_with_overrides`, reopen, confirm hydration runs and the
+override survives or is reconciled correctly.
+
+## What landed in the phase 6.5c–e session
+
+### Bridge: `SubHunkOverride` ↔ `but_db::SubHunkOverrideRow`
+
+- `to_db_row(gitdir, ov) -> Result<Option<SubHunkOverrideRow>>` and
+  `from_db_row(row) -> Result<SubHunkOverride>` in
+  `crates/but-hunk-assignment/src/sub_hunk.rs`. JSON-encodes
+  `ranges`, `rows`, and `assignments` (the last as a `Vec<(RowRange,
+  HunkAssignmentTarget)>` array of pairs to mirror the in-memory
+  `assignments_pairs` serde helper, since JSON object keys can't
+  carry `RowRange` structs).
+- `OVERRIDE_DB_SCHEMA_VERSION = 1` is stamped on every row written;
+  `from_db_row` rejects unknown versions with a clear error so a
+  future binary downgrade never silently corrupts the in-memory
+  shape.
+- `HunkAssignmentTarget` gained `PartialEq + Eq` so the reconcile
+  write-through can detect "no-op migration" cases without diffing
+  serialized JSON.
+
+### Size guard (Phase 6.5e)
+
+- `MAX_OVERRIDE_DB_BYTES = 64 * 1024`. `to_db_row` returns
+  `Ok(None)` (with a `tracing::warn!`) when
+  `anchor_diff.len() + rows_json.len()` exceeds the cap.
+- `upsert_override_persistent` honors the cap by **keeping the
+  in-memory entry** but actively **deleting any stale on-disk row
+  for the same `(gitdir, path, anchor)` key**. That way the user's
+  current session still gets the split UX while preventing the row
+  from coming back at next launch.
+
+### Hydration (Phase 6.5c)
+
+- `hydrate_from_db(db, gitdir) -> Result<usize>` reads every row for
+  the project and `upsert_override`s it into the in-memory store.
+  Rows that fail to deserialize are logged and skipped — the
+  reconcile pass on the next worktree read will drop their
+  in-memory state if the anchor is gone.
+- `ensure_hydrated(db, gitdir)` is the lazy entry point: a process-
+  wide `OnceLock<Mutex<HashSet<PathBuf>>>` tracks which `gitdir`s
+  have been hydrated, so every persistent helper can call it for
+  free at top-of-function. Errors are logged and swallowed; the
+  user's mutation still goes through.
+- This avoids the alternative of teaching `Context::open` how to
+  hydrate, which is awkward because `Context.db` is an
+  `OnDemandCache` and can't synchronously do DB reads at
+  construction time.
+
+### Write-through (Phase 6.5d)
+
+- New helpers in `sub_hunk.rs`:
+  - `upsert_override_persistent(db, gitdir, ov) -> Result<bool>`
+  - `remove_override_persistent(db, gitdir, path, anchor)`
+  - `drop_overrides_persistent(db, gitdir, keys)`
+  - `reconcile_with_overrides_persistent(db, gitdir, &mut
+    assignments)` — runs the in-memory reconcile then
+    write-throughs deletes (for dropped overrides) and upserts (for
+    migrated overrides whose `ranges` / `assignments` / `anchor_diff`
+    actually changed).
+- Wired into `but-api/src/diff.rs`: `split_hunk_with_perm` now
+  calls `upsert_override_persistent`; `unsplit_hunk_with_perm` now
+  calls `remove_override_persistent`.
+
+### Tests (9 new, all green; total 77 in `but-hunk-assignment`)
+
+- `db_row_round_trip_preserves_override`
+- `from_db_row_rejects_unknown_schema_version`
+- `to_db_row_size_guard_drops_oversize`
+- `upsert_override_persistent_writes_through`
+- `upsert_override_persistent_drops_disk_when_oversize`
+- `remove_override_persistent_clears_both_layers`
+- `drop_overrides_persistent_clears_both_layers`
+- `hydrate_from_db_rebuilds_in_memory_store`
+- `hydrate_from_db_skips_malformed_rows`
+- `ensure_hydrated_runs_once_per_gitdir` (uses a deliberate poison
+  row to confirm the second call is a true no-op)
+
+### Smoke-test fix: read-path hydration
+
+First end-to-end pass against the dev app revealed that splits
+*written* through `upsert_override_persistent` were on disk after
+`Cmd-Q`, but did **not** render after relaunch. Root cause:
+`ensure_hydrated` was only invoked from the `*_persistent` *write*
+helpers, never from the read path that fires on app open. The fix
+is a one-liner in `crates/but-api/src/diff.rs::changes_in_worktree_with_perm`:
+before the worktree-changes pipeline runs, call
+`but_hunk_assignment::ensure_hydrated(&db, &gitdir)`. Because
+`ensure_hydrated` is a process-wide once-per-gitdir guard, this is
+free on subsequent calls and covers every read path the desktop
+ever reaches (opening a project always triggers
+`changes_in_worktree`).
+
+Manual GUI smoke against `~/buttest`:
+1. Split `splittest_pure_add.md` and `athirdfile.md`.
+2. `Cmd-Q`. Confirm `sqlite3 .git/gitbutler/but.sqlite "SELECT
+   count(*) FROM sub_hunk_overrides"` returns `2`.
+3. Relaunch via `pnpm dev:desktop`.
+4. Sub-hunks render with the same boundaries as before quit. ✅
+
+### What's intentionally *not* shipped this session
+
+- **`reconcile_with_overrides_persistent` is not yet called from
+  `assignments_with_fallback` / `assign`.** Those functions take a
+  `HunkAssignmentsHandleMut` (a savepoint-borrowed handle), so to
+  also do sub-hunk DB writes we'd need to widen their signatures to
+  take `&mut DbHandle` and create the savepoint internally. That's
+  a workspace-wide signature change touching many callers; better
+  to do it as its own focused refactor. Until then:
+  - The `split_hunk` / `unsplit_hunk` paths *do* persist their own
+    mutations (above), so the user's intentional gestures survive
+    a relaunch.
+  - Read-path hydration runs at the `changes_in_worktree_with_perm`
+    entry, so the in-memory store is correctly populated on launch.
+  - The migration / drop side-effects of `reconcile_with_overrides`
+    (i.e. partial-commit anchor migrations and stale-anchor drops)
+    do **not** yet write through. On the next relaunch, hydration
+    re-introduces the pre-reconcile state; the next reconcile pass
+    will recompute the same drops/migrations in memory and the
+    eventual `split_hunk` / `unsplit_hunk` will re-persist them.
+    No data loss, but a wasted reconcile pass per launch on stale
+    overrides. Acceptable for v1; the followup refactor closes the
+    loop.
+
+### Recommended next-session pickup
+
+1. The `reconcile_with_overrides_persistent` wiring described above
+   — widen `assignments_with_fallback` / `assign` to take
+   `&mut DbHandle`, create the savepoint internally, and call the
+   `_persistent` variant. This eliminates the wasted-reconcile-on-
+   launch caveat above and gives the partial-commit migration
+   pipeline full disk durability.
+2. Phase 5d (Playwright) and Phase 6 polish (hunk-dep on sub-hunks,
+   icon polish, Storybook).
+3. Phase 7 (committed-hunk splits + cross-stack moves), which now
+   has a clean schema (1) it can extend to (gitdir, commit_id, path,
+   anchor_*) via a `schema_version=2` migration.

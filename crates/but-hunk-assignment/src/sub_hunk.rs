@@ -1225,6 +1225,309 @@ pub fn reconcile_with_overrides(gitdir: &Path, assignments: &mut Vec<HunkAssignm
     drop_overrides(gitdir, &to_drop);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 6.5c–e — disk persistence of overrides via `but-db`
+//
+// The on-disk row shape lives in `but_db::SubHunkOverrideRow`; that crate
+// intentionally treats the JSON columns as opaque strings. The bridge
+// (`to_db_row` / `from_db_row`), size guard, hydration, and write-through
+// helpers all live here so that `but-db` doesn't acquire a reverse
+// dependency on `but-hunk-assignment`.
+// ---------------------------------------------------------------------------
+
+/// Maximum on-disk size for a single override, summed across the
+/// `anchor_diff` blob and the JSON-encoded `rows` column. Hunks bigger
+/// than this are not rendered today anyway; refusing to persist them
+/// keeps DB rows bounded.
+pub const MAX_OVERRIDE_DB_BYTES: usize = 64 * 1024;
+
+/// Current on-disk schema version stamped into `sub_hunk_overrides.schema_version`.
+pub const OVERRIDE_DB_SCHEMA_VERSION: u32 = 1;
+
+/// Convert an in-memory `SubHunkOverride` into the on-disk row shape.
+///
+/// Returns `Ok(None)` (and emits a warning) if the override exceeds
+/// [`MAX_OVERRIDE_DB_BYTES`]; callers should treat that as "silently drop
+/// from disk, the in-memory entry is still fine for the current session".
+pub fn to_db_row(
+    gitdir: &Path,
+    ov: &SubHunkOverride,
+) -> Result<Option<but_db::SubHunkOverrideRow>> {
+    let ranges_json = serde_json::to_string(&ov.ranges)?;
+    let rows_json = serde_json::to_string(&ov.rows)?;
+    // Mirror the `assignments_pairs` serde helper used on the in-memory
+    // struct: emit a JSON array of `[range, target]` pairs, since JSON
+    // object keys must be strings and `RowRange` serializes as an object.
+    let pairs: Vec<(&RowRange, &HunkAssignmentTarget)> = ov.assignments.iter().collect();
+    let assignments_json = serde_json::to_string(&pairs)?;
+
+    let total = ov.anchor_diff.len() + rows_json.len();
+    if total > MAX_OVERRIDE_DB_BYTES {
+        tracing::warn!(
+            path = %ov.path,
+            total_bytes = total,
+            max = MAX_OVERRIDE_DB_BYTES,
+            "sub_hunk override exceeds size guard; refusing to persist"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(but_db::SubHunkOverrideRow {
+        gitdir: gitdir.to_string_lossy().into_owned(),
+        path: ov.path.to_vec(),
+        anchor_old_start: ov.anchor.old_start,
+        anchor_old_lines: ov.anchor.old_lines,
+        anchor_new_start: ov.anchor.new_start,
+        anchor_new_lines: ov.anchor.new_lines,
+        ranges_json,
+        assignments_json,
+        rows_json,
+        anchor_diff: ov.anchor_diff.to_vec(),
+        schema_version: OVERRIDE_DB_SCHEMA_VERSION,
+    }))
+}
+
+/// Convert an on-disk row back into an in-memory `SubHunkOverride`.
+pub fn from_db_row(row: but_db::SubHunkOverrideRow) -> Result<SubHunkOverride> {
+    if row.schema_version != OVERRIDE_DB_SCHEMA_VERSION {
+        bail!(
+            "sub_hunk_overrides row has schema_version={}, this binary supports {}",
+            row.schema_version,
+            OVERRIDE_DB_SCHEMA_VERSION,
+        );
+    }
+
+    let ranges: Vec<RowRange> = serde_json::from_str(&row.ranges_json)?;
+    let rows: Vec<RowKind> = serde_json::from_str(&row.rows_json)?;
+
+    let pairs: Vec<(RowRange, HunkAssignmentTarget)> =
+        serde_json::from_str(&row.assignments_json)?;
+    let assignments: BTreeMap<RowRange, HunkAssignmentTarget> = pairs.into_iter().collect();
+
+    Ok(SubHunkOverride {
+        path: BString::from(row.path),
+        anchor: HunkHeader {
+            old_start: row.anchor_old_start,
+            old_lines: row.anchor_old_lines,
+            new_start: row.anchor_new_start,
+            new_lines: row.anchor_new_lines,
+        },
+        ranges,
+        assignments,
+        rows,
+        anchor_diff: BString::from(row.anchor_diff),
+    })
+}
+
+fn gitdir_key(gitdir: &Path) -> String {
+    gitdir.to_string_lossy().into_owned()
+}
+
+/// Tracks which `gitdir`s have already been hydrated from disk in this
+/// process, so we never replay the load twice.
+static HYDRATED_GITDIRS: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+
+fn hydrated_gitdirs() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    HYDRATED_GITDIRS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Run [`hydrate_from_db`] exactly once per process per `gitdir`. Cheap
+/// no-op on subsequent calls. Errors are logged and swallowed so a
+/// transient DB read failure can't block the user from issuing further
+/// override mutations.
+pub fn ensure_hydrated(db: &but_db::DbHandle, gitdir: &Path) {
+    {
+        let set = hydrated_gitdirs().lock().expect("hydrate set poisoned");
+        if set.contains(gitdir) {
+            return;
+        }
+    }
+    match hydrate_from_db(db, gitdir) {
+        Ok(_n) => {}
+        Err(err) => {
+            tracing::warn!(?err, ?gitdir, "sub_hunk override hydration failed");
+        }
+    }
+    hydrated_gitdirs()
+        .lock()
+        .expect("hydrate set poisoned")
+        .insert(gitdir.to_path_buf());
+}
+
+#[cfg(test)]
+fn clear_hydrated_for_tests(gitdir: &Path) {
+    hydrated_gitdirs()
+        .lock()
+        .expect("hydrate set poisoned")
+        .remove(gitdir);
+}
+
+/// Read every override row for `gitdir` from `db` and populate the
+/// in-memory store. Returns the number of overrides hydrated.
+///
+/// Rows that fail to deserialize (e.g. because the on-disk shape drifted)
+/// are silently skipped after a warning; the surrounding `reconcile_with_overrides`
+/// pass on the next worktree read will drop their stale anchor mappings
+/// from memory if they don't match anymore.
+pub fn hydrate_from_db(db: &but_db::DbHandle, gitdir: &Path) -> Result<usize> {
+    let key = gitdir_key(gitdir);
+    let rows = db.sub_hunk_overrides().list_for_gitdir(&key)?;
+    let mut count = 0;
+    for row in rows {
+        match from_db_row(row) {
+            Ok(ov) => {
+                upsert_override(gitdir, ov);
+                count += 1;
+            }
+            Err(err) => {
+                tracing::warn!(?err, "skipping malformed sub_hunk_override row");
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Insert or replace `ov` both in memory and on disk. Returns whether
+/// the row was persisted (it is dropped from disk — but kept in memory —
+/// when [`to_db_row`] refuses it for size).
+pub fn upsert_override_persistent(
+    db: &mut but_db::DbHandle,
+    gitdir: &Path,
+    ov: SubHunkOverride,
+) -> Result<bool> {
+    ensure_hydrated(db, gitdir);
+    let row_opt = to_db_row(gitdir, &ov)?;
+    upsert_override(gitdir, ov.clone());
+    match row_opt {
+        Some(row) => {
+            db.sub_hunk_overrides_mut().upsert(row)?;
+            Ok(true)
+        }
+        None => {
+            // Refused for size. Make sure no stale row is left behind
+            // (e.g. from an earlier, smaller version of the same anchor).
+            let key = gitdir_key(gitdir);
+            let _ = db.sub_hunk_overrides_mut().delete(
+                &key,
+                &ov.path,
+                ov.anchor.old_start,
+                ov.anchor.old_lines,
+                ov.anchor.new_start,
+                ov.anchor.new_lines,
+            )?;
+            Ok(false)
+        }
+    }
+}
+
+/// Remove `(path, anchor)` both in memory and on disk.
+pub fn remove_override_persistent(
+    db: &mut but_db::DbHandle,
+    gitdir: &Path,
+    path: &BString,
+    anchor: HunkHeader,
+) -> Result<Option<SubHunkOverride>> {
+    ensure_hydrated(db, gitdir);
+    let removed = remove_override(gitdir, path, anchor);
+    let key = gitdir_key(gitdir);
+    db.sub_hunk_overrides_mut().delete(
+        &key,
+        path,
+        anchor.old_start,
+        anchor.old_lines,
+        anchor.new_start,
+        anchor.new_lines,
+    )?;
+    Ok(removed)
+}
+
+/// Drop every override in `keys` both in memory and on disk.
+pub fn drop_overrides_persistent(
+    db: &mut but_db::DbHandle,
+    gitdir: &Path,
+    keys: &[(BString, HunkHeader)],
+) -> Result<()> {
+    drop_overrides(gitdir, keys);
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let key = gitdir_key(gitdir);
+    let mut handle = db.sub_hunk_overrides_mut();
+    for (path, anchor) in keys {
+        handle.delete(
+            &key,
+            path,
+            anchor.old_start,
+            anchor.old_lines,
+            anchor.new_start,
+            anchor.new_lines,
+        )?;
+    }
+    Ok(())
+}
+
+/// `reconcile_with_overrides` plus DB write-through for any overrides that
+/// the reconcile pass drops or migrates. Use this from any path that
+/// already has a `&mut DbHandle`; the in-memory-only variant is preserved
+/// for callers that don't.
+pub fn reconcile_with_overrides_persistent(
+    db: &mut but_db::DbHandle,
+    gitdir: &Path,
+    assignments: &mut Vec<HunkAssignment>,
+) -> Result<()> {
+    ensure_hydrated(db, gitdir);
+    let before: HashMap<(BString, HunkHeader), SubHunkOverride> = list_overrides(gitdir)
+        .into_iter()
+        .map(|ov| ((ov.path.clone(), ov.anchor), ov))
+        .collect();
+    reconcile_with_overrides(gitdir, assignments);
+    let after: HashMap<(BString, HunkHeader), SubHunkOverride> = list_overrides(gitdir)
+        .into_iter()
+        .map(|ov| ((ov.path.clone(), ov.anchor), ov))
+        .collect();
+
+    let key = gitdir_key(gitdir);
+    let mut handle = db.sub_hunk_overrides_mut();
+    for ((path, anchor), _) in &before {
+        if !after.contains_key(&(path.clone(), *anchor)) {
+            handle.delete(
+                &key,
+                path,
+                anchor.old_start,
+                anchor.old_lines,
+                anchor.new_start,
+                anchor.new_lines,
+            )?;
+        }
+    }
+    for ((path, anchor), ov) in &after {
+        if before.get(&(path.clone(), *anchor)).map(|o| {
+            // Cheap structural equality without requiring `PartialEq` on the
+            // whole override: compare the few fields that actually drift.
+            o.ranges == ov.ranges
+                && o.assignments == ov.assignments
+                && o.anchor_diff == ov.anchor_diff
+        }) == Some(true)
+        {
+            continue;
+        }
+        match to_db_row(gitdir, ov)? {
+            Some(row) => handle.upsert(row)?,
+            None => {
+                let _ = handle.delete(
+                    &key,
+                    &ov.path,
+                    ov.anchor.old_start,
+                    ov.anchor.old_lines,
+                    ov.anchor.new_start,
+                    ov.anchor.new_lines,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2400,5 +2703,277 @@ mod tests {
             ) => assert_eq!(a, b),
             _ => panic!("target kind drifted across round-trip"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 6.5c–e tests: bridge + DB hydration / write-through.
+    // -----------------------------------------------------------------
+
+    fn fresh_gitdir(tag: &str) -> PathBuf {
+        // Pick a unique pseudo-gitdir per test so the global in-memory
+        // store entries don't collide between parallel tests.
+        PathBuf::from(format!(
+            "/tmp/sub_hunk_persist_test/{}/{}.git",
+            tag,
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn fresh_db() -> but_db::DbHandle {
+        but_db::DbHandle::new_at_path(":memory:").expect("in-memory db")
+    }
+
+    fn sample_override() -> SubHunkOverride {
+        let kinds = parse_row_kinds(&sample_diff());
+        let user_range = RowRange { start: 1, end: 5 };
+        let ranges = materialize_residual_ranges(&[user_range], &kinds);
+        let mut assignments: BTreeMap<RowRange, HunkAssignmentTarget> = BTreeMap::new();
+        assignments.insert(
+            user_range,
+            HunkAssignmentTarget::Stack {
+                stack_id: uuid::Uuid::new_v4().into(),
+            },
+        );
+        SubHunkOverride {
+            path: BString::from("src/foo.rs"),
+            anchor: anchor(),
+            ranges,
+            assignments,
+            rows: kinds,
+            anchor_diff: sample_diff(),
+        }
+    }
+
+    #[test]
+    fn db_row_round_trip_preserves_override() {
+        let gitdir = fresh_gitdir("round-trip");
+        let original = sample_override();
+        let row = to_db_row(&gitdir, &original)
+            .expect("to_db_row")
+            .expect("row not refused for size");
+        let restored = from_db_row(row).expect("from_db_row");
+
+        assert_eq!(restored.path, original.path);
+        assert_eq!(restored.anchor, original.anchor);
+        assert_eq!(restored.ranges, original.ranges);
+        assert_eq!(restored.rows, original.rows);
+        assert_eq!(restored.anchor_diff, original.anchor_diff);
+        assert_eq!(restored.assignments.len(), original.assignments.len());
+        for (k, v) in &original.assignments {
+            let got = restored.assignments.get(k).expect("key preserved");
+            match (v, got) {
+                (
+                    HunkAssignmentTarget::Stack { stack_id: a },
+                    HunkAssignmentTarget::Stack { stack_id: b },
+                ) => assert_eq!(a, b),
+                _ => panic!("target kind drifted"),
+            }
+        }
+    }
+
+    #[test]
+    fn from_db_row_rejects_unknown_schema_version() {
+        let gitdir = fresh_gitdir("schema-version");
+        let mut row = to_db_row(&gitdir, &sample_override()).unwrap().unwrap();
+        row.schema_version = 999;
+        let err = from_db_row(row).expect_err("future schema rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("schema_version"), "got: {msg}");
+    }
+
+    #[test]
+    fn to_db_row_size_guard_drops_oversize() {
+        let gitdir = fresh_gitdir("size-guard");
+        let mut ov = sample_override();
+        ov.anchor_diff = BString::from(vec![b'x'; MAX_OVERRIDE_DB_BYTES + 1]);
+        let result = to_db_row(&gitdir, &ov).expect("to_db_row");
+        assert!(result.is_none(), "oversize override should refuse to persist");
+    }
+
+    #[test]
+    fn upsert_override_persistent_writes_through() {
+        let gitdir = fresh_gitdir("upsert");
+        clear_store_for_tests_at(Some(&gitdir));
+        let mut db = fresh_db();
+        let ov = sample_override();
+        let persisted = upsert_override_persistent(&mut db, &gitdir, ov.clone()).unwrap();
+        assert!(persisted);
+
+        let key = gitdir_key(&gitdir);
+        let rows = db.sub_hunk_overrides().list_for_gitdir(&key).unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // In-memory store updated as well.
+        let in_mem = list_overrides(&gitdir);
+        assert_eq!(in_mem.len(), 1);
+        assert_eq!(in_mem[0].anchor, ov.anchor);
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn upsert_override_persistent_drops_disk_when_oversize() {
+        let gitdir = fresh_gitdir("upsert-oversize");
+        clear_store_for_tests_at(Some(&gitdir));
+        let mut db = fresh_db();
+
+        // First insert a small row so there's something to clean up.
+        let small = sample_override();
+        upsert_override_persistent(&mut db, &gitdir, small.clone()).unwrap();
+        let key = gitdir_key(&gitdir);
+        assert_eq!(db.sub_hunk_overrides().list_for_gitdir(&key).unwrap().len(), 1);
+
+        // Now upsert an oversized version of the same anchor: in-memory
+        // takes it, on-disk row is deleted.
+        let mut big = small;
+        big.anchor_diff = BString::from(vec![b'x'; MAX_OVERRIDE_DB_BYTES + 1]);
+        let persisted = upsert_override_persistent(&mut db, &gitdir, big).unwrap();
+        assert!(!persisted);
+        assert!(db.sub_hunk_overrides().list_for_gitdir(&key).unwrap().is_empty());
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn remove_override_persistent_clears_both_layers() {
+        let gitdir = fresh_gitdir("remove");
+        clear_store_for_tests_at(Some(&gitdir));
+        let mut db = fresh_db();
+        let ov = sample_override();
+        upsert_override_persistent(&mut db, &gitdir, ov.clone()).unwrap();
+
+        let removed =
+            remove_override_persistent(&mut db, &gitdir, &ov.path, ov.anchor).unwrap();
+        assert!(removed.is_some());
+        let key = gitdir_key(&gitdir);
+        assert!(db.sub_hunk_overrides().list_for_gitdir(&key).unwrap().is_empty());
+        assert!(list_overrides(&gitdir).is_empty());
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn drop_overrides_persistent_clears_both_layers() {
+        let gitdir = fresh_gitdir("drop");
+        clear_store_for_tests_at(Some(&gitdir));
+        let mut db = fresh_db();
+        let ov = sample_override();
+        upsert_override_persistent(&mut db, &gitdir, ov.clone()).unwrap();
+
+        drop_overrides_persistent(
+            &mut db,
+            &gitdir,
+            &[(ov.path.clone(), ov.anchor)],
+        )
+        .unwrap();
+        let key = gitdir_key(&gitdir);
+        assert!(db.sub_hunk_overrides().list_for_gitdir(&key).unwrap().is_empty());
+        assert!(list_overrides(&gitdir).is_empty());
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn hydrate_from_db_rebuilds_in_memory_store() {
+        let gitdir = fresh_gitdir("hydrate");
+        clear_store_for_tests_at(Some(&gitdir));
+        let mut db = fresh_db();
+        let ov = sample_override();
+        upsert_override_persistent(&mut db, &gitdir, ov.clone()).unwrap();
+
+        // Wipe the in-memory store, simulating a fresh process.
+        clear_store_for_tests_at(Some(&gitdir));
+        assert!(list_overrides(&gitdir).is_empty());
+
+        let n = hydrate_from_db(&db, &gitdir).unwrap();
+        assert_eq!(n, 1);
+        let restored = list_overrides(&gitdir);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].anchor, ov.anchor);
+        assert_eq!(restored[0].path, ov.path);
+        assert_eq!(restored[0].ranges, ov.ranges);
+        assert_eq!(restored[0].anchor_diff, ov.anchor_diff);
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn ensure_hydrated_runs_once_per_gitdir() {
+        let gitdir = fresh_gitdir("ensure-once");
+        clear_store_for_tests_at(Some(&gitdir));
+        clear_hydrated_for_tests(&gitdir);
+        let mut db = fresh_db();
+        let ov = sample_override();
+        upsert_override_persistent(&mut db, &gitdir, ov.clone()).unwrap();
+
+        // Simulate a fresh process: drop the in-memory store, but leave
+        // the row sitting on disk. Calling `ensure_hydrated` should pull
+        // it back; a second call must be a no-op (we tampered with the
+        // DB to detect re-hydration).
+        clear_store_for_tests_at(Some(&gitdir));
+        clear_hydrated_for_tests(&gitdir);
+
+        ensure_hydrated(&db, &gitdir);
+        assert_eq!(list_overrides(&gitdir).len(), 1);
+
+        // Wipe the in-memory store and add a poison row to the DB. If
+        // `ensure_hydrated` runs again it would surface the poison; the
+        // once-per-gitdir guard means it must not.
+        clear_store_for_tests_at(Some(&gitdir));
+        let key = gitdir_key(&gitdir);
+        db.sub_hunk_overrides_mut()
+            .upsert(but_db::SubHunkOverrideRow {
+                gitdir: key.clone(),
+                path: b"src/poison.rs".to_vec(),
+                anchor_old_start: 99,
+                anchor_old_lines: 1,
+                anchor_new_start: 99,
+                anchor_new_lines: 1,
+                ranges_json: "[]".to_string(),
+                assignments_json: "[]".to_string(),
+                rows_json: "[]".to_string(),
+                anchor_diff: b"@@ -99 +99 @@\n".to_vec(),
+                schema_version: OVERRIDE_DB_SCHEMA_VERSION,
+            })
+            .unwrap();
+        ensure_hydrated(&db, &gitdir);
+        assert!(
+            list_overrides(&gitdir).is_empty(),
+            "second ensure_hydrated must be a no-op"
+        );
+        clear_store_for_tests_at(Some(&gitdir));
+        clear_hydrated_for_tests(&gitdir);
+    }
+
+    #[test]
+    fn hydrate_from_db_skips_malformed_rows() {
+        let gitdir = fresh_gitdir("hydrate-malformed");
+        clear_store_for_tests_at(Some(&gitdir));
+        let mut db = fresh_db();
+
+        // Insert a row that we know will fail to deserialize (bogus JSON).
+        let key = gitdir_key(&gitdir);
+        db.sub_hunk_overrides_mut()
+            .upsert(but_db::SubHunkOverrideRow {
+                gitdir: key.clone(),
+                path: b"src/bad.rs".to_vec(),
+                anchor_old_start: 1,
+                anchor_old_lines: 1,
+                anchor_new_start: 1,
+                anchor_new_lines: 1,
+                ranges_json: "not-json".to_string(),
+                assignments_json: "[]".to_string(),
+                rows_json: "[]".to_string(),
+                anchor_diff: b"@@ -1 +1 @@\n".to_vec(),
+                schema_version: OVERRIDE_DB_SCHEMA_VERSION,
+            })
+            .unwrap();
+
+        // And a valid row alongside it.
+        let ov = sample_override();
+        let row = to_db_row(&gitdir, &ov).unwrap().unwrap();
+        db.sub_hunk_overrides_mut().upsert(row).unwrap();
+
+        let n = hydrate_from_db(&db, &gitdir).unwrap();
+        assert_eq!(n, 1, "only the well-formed row hydrates");
+        let in_mem = list_overrides(&gitdir);
+        assert_eq!(in_mem.len(), 1);
+        assert_eq!(in_mem[0].anchor, ov.anchor);
+        clear_store_for_tests_at(Some(&gitdir));
     }
 }

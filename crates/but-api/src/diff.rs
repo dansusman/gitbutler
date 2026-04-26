@@ -132,8 +132,16 @@ pub fn changes_in_worktree_with_perm(
     perm: &mut RepoExclusive,
 ) -> anyhow::Result<WorktreeChanges> {
     let context_lines = ctx.settings.context_lines;
+    let gitdir = ctx.gitdir.clone();
 
     let (repo, ws, mut db) = ctx.workspace_mut_and_db_mut_with_perm(perm)?;
+
+    // Phase 6.5c: lazy-hydrate persisted sub-hunk overrides on the first
+    // worktree-changes read for this `gitdir`. `ensure_hydrated` is a
+    // process-wide once-per-gitdir guard, so subsequent calls are
+    // free; placing it at this entry point covers app launch (and any
+    // path that asks the desktop for worktree assignments).
+    but_hunk_assignment::ensure_hydrated(&db, &gitdir);
 
     let changes = but_core::diff::worktree_changes(&repo)?;
 
@@ -355,7 +363,12 @@ pub fn split_hunk_with_perm(
         }
     };
 
-    but_hunk_assignment::upsert_override(
+    // Phase 6.5d: route through `upsert_override_persistent` so the
+    // override survives an app relaunch. Falls back to in-memory only
+    // when the row exceeds the size guard (see
+    // `MAX_OVERRIDE_DB_BYTES`).
+    but_hunk_assignment::upsert_override_persistent(
+        &mut db,
         &gitdir,
         SubHunkOverride {
             path: path.clone(),
@@ -365,7 +378,7 @@ pub fn split_hunk_with_perm(
             rows: kinds,
             anchor_diff,
         },
-    );
+    )?;
 
     // Trigger a reconcile so the persisted assignments and downstream consumers
     // see the materialized sub-hunks.
@@ -407,9 +420,13 @@ pub fn unsplit_hunk_with_perm(
 ) -> anyhow::Result<()> {
     let context_lines = ctx.settings.context_lines;
     let gitdir = ctx.gitdir.clone();
-    let _removed = but_hunk_assignment::remove_override(&gitdir, &path, anchor);
 
     let (repo, ws, mut db) = ctx.workspace_mut_and_db_mut_with_perm(perm)?;
+    // Phase 6.5d: write-through to disk so the override doesn't
+    // resurrect on next launch via `hydrate_from_db`.
+    let _removed = but_hunk_assignment::remove_override_persistent(
+        &mut db, &gitdir, &path, anchor,
+    )?;
     but_hunk_assignment::assignments_with_fallback(
         db.hunk_assignments_mut()?,
         &repo,
