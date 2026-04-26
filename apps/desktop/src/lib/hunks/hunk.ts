@@ -273,6 +273,129 @@ export function hunkContainsHunk(a: DiffHunk, b: DiffHunk): boolean {
 }
 
 /**
+ * Whether `header` lies entirely within `natural` according to its old
+ * and/or new line ranges. Pure-add headers (oldLines=0) are matched by
+ * their new range; pure-remove headers (newLines=0) by their old range;
+ * mixed headers must satisfy both.
+ */
+function headerWithinHunk(natural: DiffHunk, header: HunkHeader): boolean {
+	const oldOk =
+		header.oldLines === 0
+			? true
+			: header.oldStart >= natural.oldStart &&
+				header.oldStart + header.oldLines <= natural.oldStart + natural.oldLines;
+	const newOk =
+		header.newLines === 0
+			? true
+			: header.newStart >= natural.newStart &&
+				header.newStart + header.newLines <= natural.newStart + natural.newLines;
+	return oldOk && newOk;
+}
+
+/**
+ * Render the `@@ ... @@` header line for a `HunkHeader`, matching the
+ * format produced by `git diff` (the file-portion is omitted, as in
+ * `but-core`'s diff output).
+ */
+function renderHunkHeaderLine(header: HunkHeader): string {
+	return `@@ -${header.oldStart},${header.oldLines} +${header.newStart},${header.newLines} @@`;
+}
+
+/**
+ * Decide whether a row of `kind` at line numbers `(oldLine, newLine)` is
+ * "owned" by `header`. Used to partition rows of a natural hunk among the
+ * sub-hunks that materialize from a backend split.
+ */
+function rowBelongsToHeader(
+	kind: " " | "+" | "-",
+	oldLine: number,
+	newLine: number,
+	header: HunkHeader,
+): boolean {
+	const inOld = oldLine >= header.oldStart && oldLine < header.oldStart + header.oldLines;
+	const inNew = newLine >= header.newStart && newLine < header.newStart + header.newLines;
+	if (kind === " ") return inOld && inNew;
+	if (kind === "-") return inOld;
+	return inNew;
+}
+
+/**
+ * If `subHeaders` describes one or more sub-hunks of `natural` (the
+ * materialized output of a `split_hunk` operation on the backend),
+ * partition `natural`'s body rows among the sub-hunks and return one
+ * synthetic `DiffHunk` per sub-hunk. Each synthetic hunk reuses the
+ * row content of `natural` verbatim, just regrouped under its own
+ * `@@` header.
+ *
+ * If `subHeaders` is empty or contains a single header equal to
+ * `natural`, returns `[natural]` unchanged.
+ *
+ * Headers that don't fit within `natural` are ignored. Rows that don't
+ * belong to any header (which shouldn't happen for valid backend output
+ * since residuals are always emitted) are dropped silently.
+ */
+export function splitDiffHunkByHeaders(natural: DiffHunk, subHeaders: HunkHeader[]): DiffHunk[] {
+	if (subHeaders.length === 0) return [natural];
+	const sorted = subHeaders
+		.filter((h) => headerWithinHunk(natural, h))
+		.slice()
+		.sort(orderHeaders);
+	if (sorted.length === 0) return [natural];
+	if (sorted.length === 1 && hunkHeaderEquals(natural, sorted[0]!)) return [natural];
+
+	const lines = natural.diff.split("\n");
+	// Trailing newline produces an empty final element after split; preserve it.
+	const hasTrailingNewline = lines[lines.length - 1] === "";
+	if (hasTrailingNewline) lines.pop();
+
+	const buckets: string[][] = sorted.map(() => []);
+	let oldLine = natural.oldStart;
+	let newLine = natural.newStart;
+
+	for (let i = 0; i < lines.length; i++) {
+		const row = lines[i]!;
+		if (i === 0 && row.startsWith("@@")) continue;
+		const first = row[0];
+		if (first === "\\") {
+			// "\ No newline" markers travel with the previous row's bucket.
+			for (const bucket of buckets) {
+				if (bucket.length > 0) {
+					const lastInBucket = bucket[bucket.length - 1]!;
+					if (lastInBucket === lines[i - 1]) {
+						bucket.push(row);
+						break;
+					}
+				}
+			}
+			continue;
+		}
+		const kind: " " | "+" | "-" =
+			first === "+" ? "+" : first === "-" ? "-" : " ";
+		for (let bi = 0; bi < sorted.length; bi++) {
+			if (rowBelongsToHeader(kind, oldLine, newLine, sorted[bi]!)) {
+				buckets[bi]!.push(row);
+				break;
+			}
+		}
+		if (kind === " " || kind === "-") oldLine++;
+		if (kind === " " || kind === "+") newLine++;
+	}
+
+	return sorted.map((header, bi) => {
+		const body = buckets[bi]!;
+		const headerLine = renderHunkHeaderLine(header);
+		const diff = [headerLine, ...body, ...(hasTrailingNewline ? [""] : [])].join("\n");
+		return {
+			oldStart: header.oldStart,
+			oldLines: header.oldLines,
+			newStart: header.newStart,
+			newLines: header.newLines,
+			diff,
+		};
+	});
+}
+
+/**
  * Determines whether two hunk headers cover the same positions and ranges.
  *
  * This does not mean that they represent the same diffs or are even for the

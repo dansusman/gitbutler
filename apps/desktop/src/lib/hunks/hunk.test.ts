@@ -7,6 +7,7 @@ import {
 	getLineLocks,
 	orderHeaders,
 	diffToHunkHeaders,
+	splitDiffHunkByHeaders,
 } from "$lib/hunks/hunk";
 import { describe, expect, test } from "vitest";
 import type { LineId } from "@gitbutler/ui/utils/diffParsing";
@@ -1117,5 +1118,101 @@ describe.concurrent("diffToHunkHeaders", () => {
 			{ oldStart: 3, oldLines: 1, newStart: 0, newLines: 0 },
 			{ oldStart: 0, oldLines: 0, newStart: 3, newLines: 1 },
 		]);
+	});
+});
+
+describe.concurrent("splitDiffHunkByHeaders", () => {
+	const natural = {
+		oldStart: 10,
+		oldLines: 5,
+		newStart: 10,
+		newLines: 5,
+		// 6 body rows: ctx, -, +, -, +, ctx
+		diff: `@@ -10,5 +10,5 @@
+ c1
+-r1
++a1
+-r2
++a2
+ c2
+`,
+	};
+
+	test("returns natural unchanged when no headers are supplied", () => {
+		expect(splitDiffHunkByHeaders(natural, [])).toEqual([natural]);
+	});
+
+	test("returns natural unchanged when only header equals natural", () => {
+		const result = splitDiffHunkByHeaders(natural, [
+			{ oldStart: 10, oldLines: 5, newStart: 10, newLines: 5 },
+		]);
+		expect(result).toEqual([natural]);
+	});
+
+	test("three-way split produces three sub-hunks covering all rows", () => {
+		// Sub-headers as synthesize_header would produce them for ranges
+		// 0..1 (ctx), 1..3 (-r +a), 3..6 (-r +a ctx).
+		const subs = [
+			// row 0: ctx -> old/new = 10..11
+			{ oldStart: 10, oldLines: 1, newStart: 10, newLines: 1 },
+			// rows 1..3: -r +a -> old 11..12, new 11..12
+			{ oldStart: 11, oldLines: 1, newStart: 11, newLines: 1 },
+			// rows 3..6: -r +a ctx -> old 12..15, new 12..15
+			{ oldStart: 12, oldLines: 3, newStart: 12, newLines: 3 },
+		];
+		const result = splitDiffHunkByHeaders(natural, subs);
+		expect(result).toHaveLength(3);
+		expect(result[0]!.diff).toBe("@@ -10,1 +10,1 @@\n c1\n");
+		expect(result[1]!.diff).toBe("@@ -11,1 +11,1 @@\n-r1\n+a1\n");
+		expect(result[2]!.diff).toBe("@@ -12,3 +12,3 @@\n-r2\n+a2\n c2\n");
+	});
+
+	test("pure-add sub-hunk picks only the + row", () => {
+		const pureAdd = {
+			oldStart: 1,
+			oldLines: 0,
+			newStart: 1,
+			newLines: 3,
+			diff: `@@ -1,0 +1,3 @@
++a1
++a2
++a3
+`,
+		};
+		const result = splitDiffHunkByHeaders(pureAdd, [
+			{ oldStart: 1, oldLines: 0, newStart: 1, newLines: 1 },
+			{ oldStart: 1, oldLines: 0, newStart: 2, newLines: 2 },
+		]);
+		expect(result).toHaveLength(2);
+		expect(result[0]!.diff).toBe("@@ -1,0 +1,1 @@\n+a1\n");
+		expect(result[1]!.diff).toBe("@@ -1,0 +2,2 @@\n+a2\n+a3\n");
+	});
+
+	test("ignores headers that don't fit within the natural hunk", () => {
+		const result = splitDiffHunkByHeaders(natural, [
+			{ oldStart: 999, oldLines: 1, newStart: 999, newLines: 1 },
+		]);
+		expect(result).toEqual([natural]);
+	});
+
+	test("preserves '\\ No newline at end of file' markers with their row", () => {
+		const noNewline = {
+			oldStart: 1,
+			oldLines: 2,
+			newStart: 1,
+			newLines: 2,
+			diff: `@@ -1,2 +1,2 @@
+-r1
++a1
+ c1
+\\ No newline at end of file
+`,
+		};
+		const result = splitDiffHunkByHeaders(noNewline, [
+			{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1 },
+			{ oldStart: 2, oldLines: 1, newStart: 2, newLines: 1 },
+		]);
+		expect(result).toHaveLength(2);
+		expect(result[1]!.diff).toContain("\\ No newline at end of file");
 	});
 });

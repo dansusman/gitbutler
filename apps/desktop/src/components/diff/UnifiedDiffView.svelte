@@ -14,7 +14,12 @@
 	import { draggableChips } from "$lib/dragging/draggable";
 	import { HunkDropDataV3 } from "$lib/dragging/draggables";
 	import { DROPZONE_REGISTRY } from "$lib/dragging/registry";
-	import { canBePartiallySelected, getLineLocks, hunkHeaderEquals } from "$lib/hunks/hunk";
+	import {
+		canBePartiallySelected,
+		getLineLocks,
+		hunkHeaderEquals,
+		splitDiffHunkByHeaders,
+	} from "$lib/hunks/hunk";
 	import { IRC_API_SERVICE } from "$lib/irc/ircApiService";
 	import { type SelectionId } from "$lib/selection/key";
 	import { UNCOMMITTED_SERVICE } from "$lib/selection/uncommittedService.svelte";
@@ -187,15 +192,36 @@
 
 	function filter(hunks: DiffHunk[]): DiffHunk[] {
 		if (selectionId.type !== "worktree") return hunks;
-		// TODO: It does concern me that this is an N+1;
-		// We could have an encoding for hunk-headers that we can then put into
-		// a hash set.
-		const filtered = hunks.filter((hunk) => {
-			return assignments.current.some((assignment) =>
-				assignment?.hunkHeader === null ? true : hunkHeaderEquals(hunk, assignment.hunkHeader),
-			);
-		});
-		return filtered;
+		// For each natural hunk, look at the assignments for this file and:
+		//   - if any whole-file (binary / too-large) assignment exists, keep the
+		//     natural hunk verbatim,
+		//   - else partition its rows by the assignment hunk-headers that fit
+		//     within it (the materialized output of a `split_hunk` call) and
+		//     emit one synthetic DiffHunk per sub-range,
+		//   - else (no matching assignment) drop it.
+		const result: DiffHunk[] = [];
+		for (const hunk of hunks) {
+			if (assignments.current.some((a) => a?.hunkHeader === null)) {
+				result.push(hunk);
+				continue;
+			}
+			const headers = assignments.current
+				.map((a) => a.hunkHeader)
+				.filter((h): h is NonNullable<typeof h> => h !== null && h !== undefined);
+			const split = splitDiffHunkByHeaders(hunk, headers);
+			// `splitDiffHunkByHeaders` returns `[hunk]` when no headers fit, which
+			// would re-add a hunk that has no matching assignment at all. Detect
+			// that case and drop instead.
+			if (
+				split.length === 1 &&
+				split[0] === hunk &&
+				!headers.some((h) => hunkHeaderEquals(hunk, h))
+			) {
+				continue;
+			}
+			result.push(...split);
+		}
+		return result;
 	}
 
 	const filteredHunks = $derived(diff?.type === "Patch" ? filter(diff.subject.hunks) : []);
