@@ -26,6 +26,39 @@ use uuid::Uuid;
 
 use crate::{HunkAssignment, HunkAssignmentTarget};
 
+/// Serde helpers for [`SubHunkOverride::assignments`]: serialize a
+/// `BTreeMap<RowRange, HunkAssignmentTarget>` as a JSON array of
+/// `[range, target]` pairs. Required because JSON object keys must be
+/// strings, while `RowRange` serializes as an object.
+mod assignments_pairs {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{HunkAssignmentTarget, RowRange};
+
+    pub fn serialize<S>(
+        map: &BTreeMap<RowRange, HunkAssignmentTarget>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let pairs: Vec<(&RowRange, &HunkAssignmentTarget)> = map.iter().collect();
+        pairs.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<BTreeMap<RowRange, HunkAssignmentTarget>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let pairs: Vec<(RowRange, HunkAssignmentTarget)> = Vec::deserialize(deserializer)?;
+        Ok(pairs.into_iter().collect())
+    }
+}
+
 /// A row range within a natural hunk's diff body.
 ///
 /// Rows are 0-based indices into the unified-diff *body* (i.e. the `@@ ... @@`
@@ -53,7 +86,12 @@ impl RowRange {
 }
 
 /// The kind of a single row in a unified-diff hunk body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializable so that [`SubHunkOverride`] (and its `rows` field in
+/// particular) can be persisted to disk per Phase 6.5 of the
+/// line-by-line commits design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum RowKind {
     /// A ` ` (space-prefixed) context row.
     Context,
@@ -92,7 +130,14 @@ pub struct SubHunkOrigin {
 /// shape changes (e.g. because some rows were just committed), the
 /// migration pass in [`reconcile_with_overrides`] can remap each
 /// surviving range to the new natural hunk's row space.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` / `Deserialize` are derived so that the override store
+/// can be persisted to disk per Phase 6.5 of the line-by-line commits
+/// design (see `docs/line-by-line-commits-plan.md`). The on-disk
+/// representation is JSON-encoded into a `but-db` table; an in-memory
+/// round-trip test exists in this module's test suite (Phase 6.5a).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SubHunkOverride {
     pub path: BString,
     pub anchor: HunkHeader,
@@ -102,6 +147,11 @@ pub struct SubHunkOverride {
     pub ranges: Vec<RowRange>,
     /// Per-range stack reassignment, if any. Ranges absent from this map
     /// inherit the anchor's pre-split assignment.
+    ///
+    /// Serialized as a sequence of `(range, target)` pairs because JSON
+    /// object keys are restricted to strings, and `RowRange` is a struct
+    /// whose serde representation is an object.
+    #[serde(with = "assignments_pairs")]
     pub assignments: BTreeMap<RowRange, HunkAssignmentTarget>,
     /// Cached parsed row kinds of `anchor`'s diff body. Carried so the
     /// migration pass can compute line-number fingerprints without
