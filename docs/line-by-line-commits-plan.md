@@ -294,10 +294,20 @@ already re-reads materialized assignments from
 ### When to land it
 
 Not blocking the demo loop — phases 4.5 and 5 are higher-leverage
-for the feature feeling complete. But land it before phase 7 starts,
-because the committed-hunk path will need persistence on day one and
-it's strictly easier to validate the schema in the worktree-only
-world first.
+for the feature feeling complete. But land it **before phase 7
+starts**, not just "before 7 ships": phase 7 explicitly inherits
+this schema (it widens the key from `(path, anchor)` to
+`(commit_id, path, anchor)` via a `schema_version=2` migration on
+the same `sub_hunk_overrides` table), and validating the on-disk
+format in the simpler worktree-only world first is much cheaper
+than debugging a one-shot schema rollout in the middle of
+committed-hunk-rewrite churn.
+
+Consequence: 6.5 is on the critical path to 7. If 7 starts before
+6.5 lands, expect to either (a) ship a throwaway in-memory shim for
+7's overrides and rebuild persistence anyway, or (b) accept that
+an app crash mid-cross-stack-move silently drops the user's split
+state. Both are worse than just landing 6.5 first.
 
 ## Phase 7 — Splitting committed work + cross-stack moves of split pieces (NEW, critical)
 
@@ -443,12 +453,24 @@ worktree path uses, scoped to a specific source commit.
    already accommodates nested splits via re-issuing `split_hunk`
    with a finer range, but committed-hunk splits need the same
    re-entrancy verified.
-4. **Persistence.** Phase 4 / 4.5 keep overrides in process memory.
-   For committed-hunk splits the user expectation is stronger —
-   they're reorganizing recorded work, and an app crash mid-flow
-   shouldn't silently drop the split. Disk persistence becomes more
-   compelling here than it was for worktree-only splits. Punt or
-   bundle into 7f.
+4. **Persistence.** Closed by phase 6.5. The on-disk format that
+   6.5 introduces is versioned precisely so 7 can ship a
+   `schema_version=2` migration that widens the primary key from
+   `(path, anchor_*)` to `(commit_id, path, anchor_*)`. Concretely,
+   when 7 starts:
+   - Add a non-null `commit_id BLOB` column (nullable in v1, treat
+     null as "worktree") and bump `schema_version`.
+   - Either backfill existing rows with `commit_id = NULL` or
+     drop-and-rehydrate from the in-memory store on the first
+     v2 load — 6.5 already runs reconcile-on-load, so a
+     drop-and-rehydrate path costs at most one re-split for the
+     few users on the upgrade boundary.
+   - 7's `move_sub_hunk` / `uncommit_sub_hunk` write-through paths
+     reuse the same CRUD helpers 6.5 introduces; only the key
+     widens.
+
+   This question used to read "Punt or bundle into 7f." The
+   bundled answer (6.5) is the chosen path.
 
 ## Phase 5 — Gesture rewrite + popover
 
@@ -565,6 +587,9 @@ Items deferred during 1–5:
    that Stage/Comment/Cancel work on a real diff before adding Split.
 3. **Phase 5c** (Split wired up). At this point a non-developer can
    actually use the feature without the dev console.
+   Once 5c lands, also strip the dev-console invocation prerequisite
+   from `docs/lock-repro-steps.md` — the lock-repro should become a
+   pure-GUI flow.
 4. **Phase 5d** (polish + Playwright).
 5. **Phase 6** items as needed.
 
