@@ -347,6 +347,58 @@ mod to_additive_hunks {
         "#);
     }
 
+    /// A sub-hunk's *synthesized natural-rendering* header (produced by
+    /// `but_hunk_assignment::sub_hunk::synthesize_header`) carries narrower
+    /// numeric ranges than its natural anchor but has neither `old_range()`
+    /// nor `new_range()` actually `is_null()` (start != 0). The desktop's
+    /// `AmendCommitWithHunkDzHandler` historically passed the synth header
+    /// verbatim into the commit pipeline, where `to_additive_hunks` rejected
+    /// it (no exact match in `worktree_hunks`, falls through to `rejected`).
+    /// The frontend must re-encode it as a pair of null-side headers; this
+    /// test pins the expected accept-behavior for those re-encoded headers.
+    #[test]
+    fn pure_add_sub_hunk_via_null_side_encoding() {
+        // 5-row pure-add natural anchor.
+        let wth = vec![hunk_header("-1,0", "+1,5")];
+
+        // Synth header for the middle row (row index 2) would be
+        // (-1,0 +3,1) — not is_null() because old_start=1.
+        // The frontend re-encodes via `diffToHunkHeaders("commit")` to:
+        let actual = to_additive_hunks(
+            [hunk_header("-0,0", "+3,1")],
+            &wth,
+            &wth,
+        )
+        .unwrap();
+        insta::assert_debug_snapshot!(actual, @r#"
+        (
+            [
+                HunkHeader("-1,0", "+3,1"),
+            ],
+            [],
+        )
+        "#);
+    }
+
+    /// The synth header form (old_lines=0 but old_start != 0) is what the
+    /// frontend used to ship before the null-side re-encoding fix landed.
+    /// `to_additive_hunks` should *reject* it so we get the visible "Missing
+    /// diff spec association" error instead of silently committing the wrong
+    /// content. This test pins that rejection so future code never
+    /// accidentally accepts the half-null synth form.
+    #[test]
+    fn synth_sub_hunk_header_without_re_encoding_is_rejected() {
+        let wth = vec![hunk_header("-1,0", "+1,5")];
+        let synth = hunk_header("-1,0", "+3,1"); // synth header for row 2.
+        let (accepted, rejected) =
+            to_additive_hunks([synth], &wth, &wth).unwrap();
+        assert!(
+            accepted.is_empty(),
+            "synth sub-hunk header must be rejected, got {accepted:?}"
+        );
+        assert_eq!(rejected, vec![synth]);
+    }
+
     #[test]
     fn only_selections_workspace_example() {
         let wth = vec![hunk_header("-1,10", "+1,10")];

@@ -326,13 +326,32 @@ pub fn split_hunk_with_perm(
     but_hunk_assignment::sub_hunk::validate_ranges(&trimmed, row_count)
         .with_context(|| "invalid split request")?;
 
+    // Phase 4.5: store residuals as first-class ranges so they can survive
+    // partial commits via the migration pass.
+    let stored_ranges =
+        but_hunk_assignment::sub_hunk::materialize_residual_ranges(&trimmed, &kinds);
+
+    // Reconstruct the anchor's full diff (header + body) so the migration
+    // pass can content-match rows when the anchor's shape changes.
+    let mut anchor_diff = BString::default();
+    anchor_diff.extend_from_slice(
+        format!(
+            "@@ -{},{} +{},{} @@\n",
+            anchor.old_start, anchor.old_lines, anchor.new_start, anchor.new_lines
+        )
+        .as_bytes(),
+    );
+    anchor_diff.extend_from_slice(hunk.diff.as_ref());
+
     but_hunk_assignment::upsert_override(
         &gitdir,
         SubHunkOverride {
             path: path.clone(),
             anchor,
-            ranges: trimmed,
+            ranges: stored_ranges,
             assignments: BTreeMap::new(),
+            rows: kinds,
+            anchor_diff,
         },
     );
 
