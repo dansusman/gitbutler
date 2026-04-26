@@ -450,6 +450,29 @@ mod run {
         	PRIMARY KEY(`path`, `hunk_header`)
         );
 
+        -- table sub_hunk_overrides
+        CREATE TABLE `sub_hunk_overrides`(
+        	`gitdir` TEXT NOT NULL,
+        	`path` BLOB NOT NULL,
+        	`anchor_old_start` INTEGER NOT NULL,
+        	`anchor_old_lines` INTEGER NOT NULL,
+        	`anchor_new_start` INTEGER NOT NULL,
+        	`anchor_new_lines` INTEGER NOT NULL,
+        	`ranges_json` TEXT NOT NULL,
+        	`assignments_json` TEXT NOT NULL,
+        	`rows_json` TEXT NOT NULL,
+        	`anchor_diff` BLOB NOT NULL,
+        	`schema_version` INTEGER NOT NULL,
+        	PRIMARY KEY(
+        		`gitdir`,
+        		`path`,
+        		`anchor_old_start`,
+        		`anchor_old_lines`,
+        		`anchor_new_start`,
+        		`anchor_new_lines`
+        	)
+        );
+
         -- table vb_branch_targets
         CREATE TABLE `vb_branch_targets`(
         	`stack_id` TEXT NOT NULL PRIMARY KEY,
@@ -585,6 +608,7 @@ mod run {
         Text("20260105095934")
         Text("20260219130000")
         Text("20260407120000")
+        Text("20260424120000")
 
         Table: hunk_assignments
         hunk_header | path | path_bytes | stack_id | id | branch_ref
@@ -630,6 +654,9 @@ mod run {
 
         Table: vb_branch_targets
         stack_id | remote_name | branch_name | remote_url | sha | push_remote_name
+
+        Table: sub_hunk_overrides
+        gitdir | path | anchor_old_start | anchor_old_lines | anchor_new_start | anchor_new_lines | ranges_json | assignments_json | rows_json | anchor_diff | schema_version
         "#);
 
         let count = migration::run(&mut db, but_db::migration::ours())?;

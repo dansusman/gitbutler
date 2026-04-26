@@ -7,6 +7,7 @@ mod file_write_lock;
 mod forge_review;
 mod gerrit_metadata;
 mod hunk_assignments;
+mod sub_hunk_overrides;
 mod virtual_branches;
 mod workflows;
 mod workspace_rules;
