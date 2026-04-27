@@ -423,6 +423,7 @@ fn main() -> anyhow::Result<()> {
                 legacy::absorb::tauri_absorption_plan::absorption_plan,
                 diff::tauri_changes_in_worktree::changes_in_worktree,
                 diff::tauri_tree_change_diffs::tree_change_diffs,
+                diff::tauri_tree_change_diffs_in_commit::tree_change_diffs_in_commit,
                 diff::tauri_assign_hunk::assign_hunk,
                 diff::tauri_split_hunk::split_hunk,
                 diff::tauri_split_hunk_in_commit::split_hunk_in_commit,

@@ -103,6 +103,59 @@ pub fn tree_change_diffs(
     change.unified_patch(&repo, ctx.settings.context_lines)
 }
 
+/// Phase 7c-4: produces a unified patch for `change` belonging to
+/// commit `commit_id`, with any commit-anchored sub-hunk overrides
+/// (Phase 7c-3) materialized into the returned hunks.
+///
+/// The desktop calls this from commit-diff views that want
+/// sub-hunk boundaries to render. Worktree views continue to use
+/// [`tree_change_diffs`].
+///
+/// Hunks without a matching `(commit_id, path, anchor)` override
+/// pass through unchanged. Binary / too-large patches pass through
+/// unchanged.
+#[but_api(napi)]
+#[instrument(skip_all, err(Debug))]
+pub fn tree_change_diffs_in_commit(
+    ctx: &Context,
+    commit_id: gix::ObjectId,
+    change: TreeChange,
+) -> anyhow::Result<Option<but_core::UnifiedPatch>> {
+    let change: but_core::TreeChange = change.into();
+    let path = change.path.clone();
+    let repo = ctx.repo.get()?;
+    let Some(patch) = change.unified_patch(&repo, ctx.settings.context_lines)? else {
+        return Ok(None);
+    };
+
+    // Phase 6.5c hydration parity: the commit-diff path is reachable
+    // before any worktree-changes call when the user opens a commit
+    // first thing after relaunch. Run `ensure_hydrated` once per
+    // process per `gitdir` so persisted commit-keyed overrides land
+    // in memory.
+    let gitdir = ctx.gitdir.clone();
+    let (_guard, _repo, _ws, db) = ctx.workspace_and_db()?;
+    but_hunk_assignment::ensure_hydrated(&db, &gitdir);
+    drop(db);
+
+    // Filter to overrides that anchor on this `(commit_id, path)`.
+    let mut overrides: Vec<but_hunk_assignment::SubHunkOverride> =
+        but_hunk_assignment::list_commit_overrides(&gitdir, commit_id)
+            .into_iter()
+            .filter(|ov| ov.path == path)
+            .collect();
+    if overrides.is_empty() {
+        return Ok(Some(patch));
+    }
+    // Stable order: by anchor's new_start so the materialized
+    // result is deterministic across calls.
+    overrides.sort_by_key(|ov| (ov.anchor.new_start, ov.anchor.new_lines));
+
+    Ok(Some(but_hunk_assignment::apply_commit_overrides_to_patch(
+        patch, &overrides,
+    )))
+}
+
 /// See [`changes_in_worktree_with_perm()`].
 #[but_api(napi)]
 #[instrument(err(Debug))]

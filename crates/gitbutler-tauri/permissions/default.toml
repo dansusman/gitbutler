@@ -207,6 +207,7 @@ commands.allow = [
   "target_commits",
   "tear_off_branch",
   "tree_change_diffs",
+  "tree_change_diffs_in_commit",
   "unapply_stack",
   "update_branch_name",
   "update_branch_pr_number",

@@ -20,7 +20,7 @@ use std::{
 
 use anyhow::{Result, bail};
 use bstr::{BString, ByteSlice};
-use but_core::HunkHeader;
+use but_core::{HunkHeader, UnifiedPatch, unified_diff::DiffHunk};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -439,6 +439,79 @@ pub fn synthesize_header(anchor: &HunkHeader, kinds: &[RowKind], range: RowRange
         old_lines,
         new_start: anchor.new_start + new_offset_before,
         new_lines,
+    }
+}
+
+/// Phase 7c-4: replace each natural hunk in `patch` whose anchor
+/// matches a `Commit`-keyed override in `overrides` with N sub-hunks
+/// carrying synthesized `HunkHeader`s and sliced diff bodies. Hunks
+/// without a matching override pass through unchanged.
+///
+/// The caller filters `overrides` to those whose `(commit_id, path)`
+/// match the patch (typically via
+/// [`list_commit_overrides`](crate::list_commit_overrides) plus a
+/// per-path filter).
+///
+/// The output's `lines_added` / `lines_removed` totals are preserved
+/// — splitting a hunk into N sub-hunks doesn't change the total
+/// row counts. Sub-hunks whose `range` collapses to empty after
+/// `trim_context` are skipped (defensive; the override's stored
+/// ranges should already be non-empty post-upsert).
+pub fn apply_commit_overrides_to_patch(
+    patch: UnifiedPatch,
+    overrides: &[SubHunkOverride],
+) -> UnifiedPatch {
+    let UnifiedPatch::Patch {
+        hunks,
+        is_result_of_binary_to_text_conversion,
+        lines_added,
+        lines_removed,
+    } = patch
+    else {
+        return patch;
+    };
+
+    let mut new_hunks: Vec<DiffHunk> = Vec::with_capacity(hunks.len());
+    for hunk in hunks {
+        let header = HunkHeader::from(&hunk);
+        let matching = overrides.iter().find(|ov| ov.anchor == header);
+        let Some(ov) = matching else {
+            new_hunks.push(hunk);
+            continue;
+        };
+        for range in &ov.ranges {
+            if range.is_empty() {
+                continue;
+            }
+            let sub_header = synthesize_header(&ov.anchor, &ov.rows, *range);
+            let body = sub_diff_body(ov.anchor_diff.as_ref(), *range);
+            if body.is_empty() {
+                continue;
+            }
+            let mut diff: Vec<u8> = format!(
+                "@@ -{},{} +{},{} @@\n",
+                sub_header.old_start,
+                sub_header.old_lines,
+                sub_header.new_start,
+                sub_header.new_lines,
+            )
+            .into_bytes();
+            diff.extend_from_slice(body.as_ref());
+            new_hunks.push(DiffHunk {
+                old_start: sub_header.old_start,
+                old_lines: sub_header.old_lines,
+                new_start: sub_header.new_start,
+                new_lines: sub_header.new_lines,
+                diff: BString::from(diff),
+            });
+        }
+    }
+
+    UnifiedPatch::Patch {
+        hunks: new_hunks,
+        is_result_of_binary_to_text_conversion,
+        lines_added,
+        lines_removed,
     }
 }
 
@@ -3691,6 +3764,125 @@ mod tests {
         assert_eq!(restored.anchor, anchor());
 
         clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 7c-4 — commit-diff override materialization into
+    // `UnifiedPatch`.
+    // ---------------------------------------------------------------
+
+    fn natural_hunk_for(diff_with_header: &BString, header: HunkHeader) -> DiffHunk {
+        DiffHunk {
+            old_start: header.old_start,
+            old_lines: header.old_lines,
+            new_start: header.new_start,
+            new_lines: header.new_lines,
+            diff: diff_with_header.clone(),
+        }
+    }
+
+    fn natural_patch(hunks: Vec<DiffHunk>) -> UnifiedPatch {
+        UnifiedPatch::Patch {
+            hunks,
+            is_result_of_binary_to_text_conversion: false,
+            lines_added: 2,
+            lines_removed: 2,
+        }
+    }
+
+    #[test]
+    fn apply_commit_overrides_passes_unmatched_hunks_through() {
+        // No override → the patch is returned bit-identical.
+        let h = natural_hunk_for(&sample_diff(), anchor());
+        let patch = natural_patch(vec![h.clone()]);
+        let out = apply_commit_overrides_to_patch(patch, &[]);
+        let UnifiedPatch::Patch { hunks, .. } = out else {
+            panic!("expected Patch variant");
+        };
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_start, h.old_start);
+        assert_eq!(hunks[0].diff, h.diff);
+    }
+
+    #[test]
+    fn apply_commit_overrides_passes_binary_through() {
+        let out =
+            apply_commit_overrides_to_patch(UnifiedPatch::Binary, &[]);
+        assert!(matches!(out, UnifiedPatch::Binary));
+    }
+
+    #[test]
+    fn apply_commit_overrides_replaces_matching_hunk_with_sub_hunks() {
+        // 6-row anchor (ctx -r +a -r +a ctx). Override carves the
+        // middle pair (rows 2..4) so we expect three sub-hunks:
+        // leading residual (1..2), user (2..4), trailing residual
+        // (4..5). All three are non-context.
+        let h = natural_hunk_for(&sample_diff(), anchor());
+        let patch = natural_patch(vec![h.clone()]);
+
+        let ov = make_stored_override(
+            anchor(),
+            sample_diff(),
+            vec![RowRange { start: 2, end: 4 }],
+            BTreeMap::new(),
+        );
+        let out = apply_commit_overrides_to_patch(patch, &[ov]);
+        let UnifiedPatch::Patch { hunks, .. } = out else {
+            panic!("expected Patch variant");
+        };
+        assert_eq!(hunks.len(), 3, "three sub-hunks");
+
+        // Each carries its own `@@` header line.
+        for sh in &hunks {
+            assert!(
+                sh.diff.starts_with(b"@@ "),
+                "sub-hunk diff must start with @@ header"
+            );
+        }
+
+        // Header numbers come from `synthesize_header`, so each
+        // sub-hunk's `(old_start, old_lines, new_start, new_lines)`
+        // matches the field set on its `DiffHunk`.
+        for sh in &hunks {
+            let header_line: &[u8] = sh.diff.lines().next().unwrap_or(&[][..]);
+            let expected = format!(
+                "@@ -{},{} +{},{} @@",
+                sh.old_start, sh.old_lines, sh.new_start, sh.new_lines
+            );
+            assert_eq!(header_line, expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn apply_commit_overrides_skips_overrides_for_other_hunks() {
+        // A patch with two natural hunks, but the override only
+        // matches one. The other passes through unchanged.
+        let other_anchor = HunkHeader {
+            old_start: 100,
+            old_lines: 1,
+            new_start: 100,
+            new_lines: 1,
+        };
+        let other_diff = BString::from("@@ -100,1 +100,1 @@\n-foo\n+bar\n");
+        let h_match = natural_hunk_for(&sample_diff(), anchor());
+        let h_other = natural_hunk_for(&other_diff, other_anchor);
+        let patch = natural_patch(vec![h_match, h_other.clone()]);
+
+        let ov = make_stored_override(
+            anchor(),
+            sample_diff(),
+            vec![RowRange { start: 2, end: 4 }],
+            BTreeMap::new(),
+        );
+        let out = apply_commit_overrides_to_patch(patch, &[ov]);
+        let UnifiedPatch::Patch { hunks, .. } = out else {
+            panic!("expected Patch variant");
+        };
+        // 3 sub-hunks (matched) + 1 unchanged (other) = 4 hunks.
+        assert_eq!(hunks.len(), 4);
+        // Last hunk is the unchanged "other".
+        assert_eq!(hunks[3].old_start, 100);
+        assert_eq!(hunks[3].diff, other_diff);
     }
 
     #[test]

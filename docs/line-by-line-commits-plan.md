@@ -448,7 +448,12 @@ worktree path uses, scoped to a specific source commit.
 - **7c-3:** `split_hunk_in_commit` and `unsplit_hunk_in_commit` RPCs
   in `but-api/src/diff.rs`; new `remove_override_at` /
   `remove_override_persistent_at` helpers; Tauri allowlist + main.rs
-  invoke list. **✅ Shipped this session.**
+  invoke list. **✅ Shipped.**
+- **7c-4:** `tree_change_diffs_in_commit` RPC + new
+  `apply_commit_overrides_to_patch` materialization helper that
+  replaces matching natural hunks in a `UnifiedPatch` with N
+  sub-hunks carrying synthesized headers and sliced diff bodies.
+  **✅ Shipped this session.**
 - **7c:** add `split_hunk` variant for `(commit_id, path, anchor)`,
   validate per-range constraints exactly as the worktree path does.
 - **7d:** wrap `move_changes_between_commits` and `uncommit_changes`
@@ -1812,3 +1817,109 @@ RPCs that let a commit-diff view register a sub-hunk split.
    override on the source needs to migrate to the rewritten commit
    id (via the same content-match logic Phase 4.5 used for the
    worktree case).
+
+## What landed in the phase 7c-4 session
+
+### Phase 7c-4 — Commit-diff override-aware diff RPC
+
+**Why this exists.** Phase 7c-3 made it possible to *create* a
+`Commit { id, path }`-keyed override via `split_hunk_in_commit`, but
+the desktop's per-commit diff fetch path (`tree_change_diffs(change)`)
+doesn't know which commit the change belongs to and so couldn't apply
+the override on read. 7c-4 adds the parallel RPC that takes
+`commit_id` explicitly and runs an override-materialization pass on
+the resulting unified patch.
+
+**Why backend-side materialization (not frontend).** For the worktree
+case, sub-hunks come through `HunkAssignment` rows whose synthesized
+`HunkHeader`s the frontend feeds into `splitDiffHunkByHeaders` to
+slice the natural diff text. The commit-diff API has no such
+`HunkAssignment` channel — the unified patch is the whole API
+surface. Easiest path: have the backend return a `UnifiedPatch` whose
+`hunks` already include the sub-hunks as if they were natural
+multi-hunk patches. The frontend renders them with no special-case
+logic.
+
+**Changes in `crates/but-hunk-assignment`** (`sub_hunk.rs`):
+
+- New `pub fn apply_commit_overrides_to_patch(patch, overrides) ->
+  UnifiedPatch`. For each natural hunk in `patch`, if any override
+  in `overrides` has a matching anchor (exact `HunkHeader` equality),
+  replace the hunk with N sub-hunks built from `override.ranges`.
+  Each sub-hunk's `diff` is `<synthesized @@ header>\n<body slice>`,
+  built from `synthesize_header` + `sub_diff_body`. Hunks without a
+  match pass through unchanged. Binary / TooLarge patches pass
+  through unchanged. `lines_added` / `lines_removed` are preserved
+  (splitting doesn't change row totals).
+- Defensive: skips `range.is_empty()` and empty-body sub-hunks. The
+  override's stored ranges should already be non-empty post-upsert,
+  but the helper is reachable from any caller.
+- Exported from `lib.rs`.
+
+**Changes in `crates/but-api`** (`src/diff.rs`):
+
+- New RPC `tree_change_diffs_in_commit(ctx, commit_id, change) ->
+  Option<UnifiedPatch>`. Same shape as `tree_change_diffs` but takes
+  `commit_id` explicitly. Calls `change.unified_patch` to compute
+  the natural patch, runs `ensure_hydrated` (Phase 6.5c) so
+  persisted commit-keyed overrides land in memory if this is the
+  first read after relaunch, then filters
+  `list_commit_overrides(gitdir, commit_id)` by `path` and applies
+  `apply_commit_overrides_to_patch`.
+- The override list is sorted by `(anchor.new_start, anchor.new_lines)`
+  before application so the materialized result is deterministic
+  across calls.
+- `#[but_api(napi)]` + `#[instrument(skip_all)]` decorated to
+  mirror existing patterns. Read-only context (`ctx.workspace_and_db`).
+
+**Changes in `crates/gitbutler-tauri`**:
+
+- `permissions/default.toml`: added `"tree_change_diffs_in_commit"`
+  to the allowlist.
+- `main.rs`: registered
+  `diff::tauri_tree_change_diffs_in_commit::tree_change_diffs_in_commit`
+  in the `tauri::generate_handler!` invoke list.
+
+**Tests** (4 new, total 93 in `but-hunk-assignment`):
+
+- `apply_commit_overrides_passes_unmatched_hunks_through` — patch
+  with one hunk and no overrides comes back bit-identical.
+- `apply_commit_overrides_passes_binary_through` — `UnifiedPatch::Binary`
+  short-circuits.
+- `apply_commit_overrides_replaces_matching_hunk_with_sub_hunks` —
+  6-row anchor (ctx -r +a -r +a ctx) with a user-pick of rows 2..4
+  produces three sub-hunks (leading residual + user + trailing
+  residual). Each sub-hunk's `diff` starts with its own `@@`
+  header and the header numbers match the field set on the
+  `DiffHunk`.
+- `apply_commit_overrides_skips_overrides_for_other_hunks` — patch
+  with two natural hunks where the override matches only one; the
+  other passes through unchanged.
+
+**Test totals after this session**: `but-hunk-assignment` 93,
+`but-db` 134, `but-api` builds clean. Workspace builds clean.
+
+### What's *not* shipped this session (deferred to 7c-5)
+
+- **No frontend wiring.** The desktop still calls `tree_change_diffs`
+  for every diff fetch. 7c-5 threads `commitId` through the diff
+  view's RPC choice and reuses the existing render path; no diff
+  splitting on the frontend is needed because the backend now
+  returns sub-hunks as if they were natural hunks.
+
+### Recommended next-session pickup
+
+1. **Phase 7c-5** — frontend RPC routing. Add a
+   `getDiffInCommit({projectId, commitId, change})` query in
+   `apps/desktop/src/lib/worktree/worktreeEndpoints.ts` (or a new
+   `commitEndpoints.ts`) targeting the `tree_change_diffs_in_commit`
+   command. `splitHunkInCommit` / `unsplitHunkInCommit` mutations
+   the same. Where the diff view is invoked with a `commitId`,
+   call the new endpoint instead of `getDiff`. The split-icon /
+   sub-hunk re-split UI already exists from Phase 4–5 and works
+   off the `DiffHunk` shape, so once the backend returns sub-hunks
+   the icon + drag affordances should light up automatically. The
+   only additional UI work is wiring the popover's `Split` action
+   to `splitHunkInCommit` when in a commit view.
+2. **Phase 7d** — `move_sub_hunk` / `uncommit_sub_hunk` RPCs.
+3. **Phase 7f** — override migration on commit rewrite.
