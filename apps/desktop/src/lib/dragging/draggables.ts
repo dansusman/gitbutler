@@ -18,6 +18,17 @@ export class HunkDropDataV3 {
 		readonly stackId: string | null,
 		readonly commitId: string | undefined,
 		readonly selectionId: SelectionId,
+		/**
+		 * Phase 7e: when this drag represents a *sub-hunk* of a committed
+		 * (or worktree) anchor, `subAnchor` is the natural anchor's
+		 * `HunkHeader` and `subRange` is the row range the user split
+		 * out. Drag handlers route sub-hunk drops through
+		 * `move_sub_hunk` / `uncommit_sub_hunk` (committed origin) or the
+		 * existing assignment flow (worktree origin) when both fields are
+		 * set.
+		 */
+		readonly subAnchor: HunkHeader | undefined = undefined,
+		readonly subRange: { start: number; end: number } | undefined = undefined,
 	) {}
 }
 

@@ -56,7 +56,8 @@
 		{@const changeQuery = idSelection.changeByKey(projectId, selectedFile)}
 		<ReduxResult {projectId} result={changeQuery.result}>
 			{#snippet children(change)}
-				{@const diffQuery = diffService.getDiff(projectId, change)}
+				{@const commitIdForDiff = selectedFile.type === "commit" ? selectedFile.commitId : undefined}
+				{@const diffQuery = diffService.getDiff(projectId, change, commitIdForDiff)}
 				{@const isExecutable = isExecutableStatus(change.status)}
 				<ReduxResult {projectId} result={diffQuery.result}>
 					{#snippet children(diff, env)}

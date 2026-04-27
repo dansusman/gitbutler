@@ -14,8 +14,23 @@ export const DIFF_SERVICE = new InjectionToken<DiffService>("DiffService");
 export class DiffService {
 	constructor(private backendApi: BackendApi) {}
 
-	getDiff(projectId: string, change: TreeChange) {
+	getDiff(projectId: string, change: TreeChange, commitId?: string) {
+		if (commitId) {
+			return this.backendApi.endpoints.getDiffInCommit.useQuery({
+				projectId,
+				commitId,
+				change,
+			});
+		}
 		return this.backendApi.endpoints.getDiff.useQuery({ projectId, change });
+	}
+
+	listCommitOverrideAnchors(projectId: string, commitId: string, path: number[]) {
+		return this.backendApi.endpoints.listCommitOverrideAnchors.useQuery({
+			projectId,
+			commitId,
+			path,
+		});
 	}
 
 	get assignHunk() {
@@ -30,7 +45,19 @@ export class DiffService {
 		return this.backendApi.endpoints.unsplitHunk.mutate;
 	}
 
-	async fetchDiff(projectId: string, change: TreeChange) {
+	get splitHunkInCommit() {
+		return this.backendApi.endpoints.splitHunkInCommit.mutate;
+	}
+
+	get unsplitHunkInCommit() {
+		return this.backendApi.endpoints.unsplitHunkInCommit.mutate;
+	}
+
+	async fetchDiff(projectId: string, change: TreeChange, commitId?: string) {
+		if (commitId) {
+			const { getDiffInCommit } = this.backendApi.endpoints;
+			return await getDiffInCommit.fetch({ projectId, commitId, change });
+		}
 		const { getDiff } = this.backendApi.endpoints;
 		return await getDiff.fetch({ projectId, change });
 	}

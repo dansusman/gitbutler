@@ -64,6 +64,7 @@ export enum TestId {
 	BranchChangedFileList = "branch-changed-file-list",
 	UnifiedDiffView = "unified-diff-view",
 	UnifiedDiffViewLockWarning = "unified-diff-view-lock-warning",
+	UnsplitSubHunkButton = "unsplit-sub-hunk-button",
 	ToastInfoMessage = "toast-info-message",
 	Stack = "stack",
 	StackHeader = "stack-header",

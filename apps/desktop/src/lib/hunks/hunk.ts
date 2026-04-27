@@ -365,6 +365,13 @@ function rowBelongsToHeader(
 export type SplitDiffHunk = {
 	hunk: DiffHunk;
 	anchor?: HunkHeader;
+	/**
+	 * Phase 7e: when the sub-hunk was emitted by a commit-anchored
+	 * override (rather than synthesized via `splitDiffHunkByHeaders`),
+	 * this is the row range the override partitions out. Drag handlers
+	 * use it to call `move_sub_hunk` / `uncommit_sub_hunk`.
+	 */
+	subRange?: { start: number; end: number };
 };
 
 /**

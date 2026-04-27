@@ -289,11 +289,47 @@ export class UncommitDzHandler implements DropzoneHandler {
 			if (!(data.stackId && data.commitId)) {
 				throw new Error("Can't receive a change without it's source or commit");
 			}
-			const previousPathBytes =
-				data.change.status.type === "Rename" ? data.change.status.subject.previousPathBytes : null;
 
 			const sourceStackId = data.stackId;
 			const sourceCommitId = data.commitId;
+
+			// Phase 7e: sub-hunk drag (committed sub-hunk → worktree).
+			// Route through `uncommit_sub_hunk` so the backend encodes the
+			// `(anchor, range)` pair into the null-side `HunkHeader` form
+			// `to_additive_hunks` consumes. Falling through to the
+			// natural-hunk `uncommit_changes` would forward the synthesized
+			// sub-hunk header verbatim and trigger a "Missing diff spec
+			// association" rejection.
+			if (data.subAnchor && data.subRange) {
+				const subAnchor = data.subAnchor;
+				const subRange = data.subRange;
+				await withStackBusy(
+					this.uiState,
+					this.projectId,
+					{ commitId: sourceCommitId, stackIds: [sourceStackId] },
+					async () => {
+						const { workspace } = await this.stackService.uncommitSubHunk({
+							projectId: this.projectId,
+							commitId: sourceCommitId,
+							path: Array.from(data.change.pathBytes),
+							anchor: subAnchor,
+							range: subRange,
+							assignTo: this.assignTo,
+							dryRun: false,
+						});
+						updateUiState(
+							this.uiState,
+							sourceStackId,
+							sourceCommitId,
+							workspace.replacedCommits,
+						);
+					},
+				);
+				return;
+			}
+
+			const previousPathBytes =
+				data.change.status.type === "Rename" ? data.change.status.subject.previousPathBytes : null;
 
 			await withStackBusy(
 				this.uiState,
@@ -378,6 +414,40 @@ export class AmendCommitWithHunkDzHandler implements DropzoneHandler {
 
 				const sourceStackId = data.stackId;
 				const sourceCommitId = data.commitId;
+
+				// Phase 7e: sub-hunk drag (committed sub-hunk → another
+				// commit). Route through `move_sub_hunk` for the same
+				// reasons as the uncommit branch above — the synth header
+				// won't pass `to_additive_hunks` containment matching as
+				// a natural-hunk move.
+				if (data.subAnchor && data.subRange) {
+					const subAnchor = data.subAnchor;
+					const subRange = data.subRange;
+					await withStackBusy(
+						this.uiState,
+						projectId,
+						{ commitId: sourceCommitId, stackIds: [sourceStackId, stackId] },
+						async () => {
+							const { workspace } = await this.stackService.moveSubHunk({
+								projectId,
+								sourceCommitId,
+								destinationCommitId: commit.id,
+								path: Array.from(data.change.pathBytes),
+								anchor: subAnchor,
+								range: subRange,
+								dryRun: false,
+							});
+							updateUiState(
+								this.uiState,
+								sourceStackId,
+								sourceCommitId,
+								workspace.replacedCommits,
+							);
+							updateUiState(this.uiState, stackId, commit.id, workspace.replacedCommits);
+						},
+					);
+					return;
+				}
 
 				await withStackBusy(
 					this.uiState,

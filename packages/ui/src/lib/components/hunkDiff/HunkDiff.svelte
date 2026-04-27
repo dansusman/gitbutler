@@ -7,6 +7,7 @@
 <script lang="ts">
 	import Icon from "$components/Icon.svelte";
 	import HunkDiffBody from "$components/hunkDiff/HunkDiffBody.svelte";
+	import { TestId } from "$lib/utils/testIds";
 	import ScrollableContainer from "$components/scroll/ScrollableContainer.svelte";
 	import { focusable } from "$lib/focus/focusable";
 	import {
@@ -194,6 +195,7 @@
 							<button
 								type="button"
 								class="table__sub-hunk-icon"
+								data-testid={TestId.UnsplitSubHunkButton}
 								title="Un-split: merge this sub-hunk back into the natural hunk"
 								aria-label="Un-split sub-hunk"
 								onclick={(e) => {

@@ -37,6 +37,7 @@ import type {
 	RejectionReason,
 	CommitUndoResult,
 	InsertSide,
+	HunkHeader,
 	RelativeTo,
 } from "@gitbutler/but-sdk";
 
@@ -604,6 +605,55 @@ export function buildStackEndpoints(build: BackendEndpointBuilder) {
 					invalidatesList(ReduxTag.BranchChanges),
 				];
 			},
+		}),
+		// ── Phase 7e: sub-hunk move / uncommit ─────────────────────
+		moveSubHunk: build.mutation<
+			MoveChangesResult,
+			{
+				projectId: string;
+				sourceCommitId: string;
+				destinationCommitId: string;
+				path: number[];
+				anchor: HunkHeader;
+				range: { start: number; end: number };
+				dryRun: boolean;
+			}
+		>({
+			extraOptions: {
+				command: "move_sub_hunk",
+				actionName: "Move Sub-Hunk Between Commits",
+			},
+			query: (args) => args,
+			invalidatesTags: [
+				invalidatesList(ReduxTag.HeadSha),
+				invalidatesList(ReduxTag.WorktreeChanges),
+				invalidatesList(ReduxTag.CommitChanges),
+				invalidatesList(ReduxTag.Diff),
+			],
+		}),
+		uncommitSubHunk: build.mutation<
+			MoveChangesResult,
+			{
+				projectId: string;
+				commitId: string;
+				path: number[];
+				anchor: HunkHeader;
+				range: { start: number; end: number };
+				assignTo?: string;
+				dryRun: boolean;
+			}
+		>({
+			extraOptions: {
+				command: "uncommit_sub_hunk",
+				actionName: "Uncommit Sub-Hunk",
+			},
+			query: (args) => args,
+			invalidatesTags: [
+				invalidatesList(ReduxTag.HeadSha),
+				invalidatesList(ReduxTag.WorktreeChanges),
+				invalidatesList(ReduxTag.BranchChanges),
+				invalidatesList(ReduxTag.Diff),
+			],
 		}),
 		stashIntoBranch: build.mutation<
 			DiffSpec[],

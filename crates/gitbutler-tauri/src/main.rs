@@ -429,6 +429,7 @@ fn main() -> anyhow::Result<()> {
                 diff::tauri_split_hunk_in_commit::split_hunk_in_commit,
                 diff::tauri_unsplit_hunk::unsplit_hunk,
                 diff::tauri_unsplit_hunk_in_commit::unsplit_hunk_in_commit,
+                diff::tauri_list_commit_override_anchors::list_commit_override_anchors,
                 #[cfg(unix)]
                 legacy::workspace::tauri_show_graph_svg::show_graph_svg,
                 legacy::claude::tauri_claude_get_session_details::claude_get_session_details,
@@ -546,6 +547,8 @@ fn main() -> anyhow::Result<()> {
                 commit::move_commit::tauri_commit_move::commit_move,
                 commit::move_changes::tauri_commit_move_changes_between::commit_move_changes_between,
                 commit::uncommit::tauri_commit_uncommit_changes::commit_uncommit_changes,
+                commit::sub_hunk::tauri_move_sub_hunk::move_sub_hunk,
+                commit::sub_hunk::tauri_uncommit_sub_hunk::uncommit_sub_hunk,
                 commit::undo::tauri_commit_undo::commit_undo,
                 platform::tauri_build_type::build_type,
             ])

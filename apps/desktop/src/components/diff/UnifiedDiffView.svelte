@@ -144,6 +144,18 @@
 		newStart: number;
 		newLines: number;
 	}) {
+		if (commitId) {
+			// Phase 7c-5: commit-anchored sub-hunks have no per-line stack
+			// reassignments today; the divergent-assignment confirm is
+			// worktree-only.
+			await diffService.unsplitHunkInCommit({
+				projectId,
+				commitId,
+				path: pathToBytes(change.path),
+				anchor,
+			});
+			return;
+		}
 		if (subHunksHaveDivergentAssignments(anchor)) {
 			const confirmed = window.confirm(
 				"Un-split will discard the per-line stack reassignments for this hunk. Continue?",
@@ -275,6 +287,16 @@
 			newStart: p.naturalHunk.newStart,
 			newLines: p.naturalHunk.newLines,
 		};
+		if (commitId) {
+			await diffService.splitHunkInCommit({
+				projectId,
+				commitId,
+				path: pathToBytes(change.path),
+				anchor,
+				ranges: [{ start: range.start, end: range.end }],
+			});
+			return;
+		}
 		await diffService.splitHunk({
 			projectId,
 			path: pathToBytes(change.path),
@@ -291,10 +313,14 @@
 		const total = countBodyRows(p.naturalHunk);
 		if (range.start === 0 && range.end >= total)
 			return { disabled: true, reason: "Selection covers the entire hunk." };
-		if (!isUncommittedChange) {
+		// Phase 7c-5: committed-hunk splits are now supported when a
+		// commitId is in scope. Worktree views still allow splitting
+		// without a commitId. The legacy "branch"-typed selection (no
+		// commitId, not worktree) remains unsupported.
+		if (!isUncommittedChange && !commitId) {
 			return {
 				disabled: true,
-				reason: "Splitting committed work is not yet supported (Phase 7).",
+				reason: "Splitting this view is not supported.",
 			};
 		}
 		return { disabled: false, reason: undefined };
@@ -342,6 +368,65 @@
 
 	const assignments = $derived(uncommittedService.assignmentsByPath(stackId || null, change.path));
 
+	// Phase 7c-5: for commit-diff views, fetch the natural-anchor
+	// `HunkHeader`s of any commit-keyed sub-hunk overrides so the
+	// filter pass can tag the materialized sub-hunks (returned
+	// pre-sliced by `tree_change_diffs_in_commit`) with their natural
+	// anchor for the split-icon + un-split affordances.
+	const commitOverrideAnchorsQuery = $derived(
+		commitId
+			? diffService.listCommitOverrideAnchors(
+					projectId,
+					commitId,
+					pathToBytes(change.path),
+				)
+			: undefined,
+	);
+	const commitOverrideAnchors = $derived(
+		commitOverrideAnchorsQuery?.response ?? [],
+	);
+
+	function findCommitNaturalAnchorSummary(
+		hunk: DiffHunk,
+	):
+		| {
+				anchor: { oldStart: number; oldLines: number; newStart: number; newLines: number };
+				ranges: { start: number; end: number }[];
+		  }
+		| undefined {
+		if (commitOverrideAnchors.length === 0) return undefined;
+		for (const s of commitOverrideAnchors) {
+			const a = s.anchor;
+			if (hunkHeaderEquals(hunk, a)) continue;
+			const contained =
+				hunk.oldStart >= a.oldStart &&
+				hunk.oldStart + hunk.oldLines <= a.oldStart + a.oldLines &&
+				hunk.newStart >= a.newStart &&
+				hunk.newStart + hunk.newLines <= a.newStart + a.newLines;
+			if (contained) {
+				return {
+					anchor: {
+						oldStart: a.oldStart,
+						oldLines: a.oldLines,
+						newStart: a.newStart,
+						newLines: a.newLines,
+					},
+					ranges: s.ranges.map((r) => ({ start: r.start, end: r.end })),
+				};
+			}
+		}
+		return undefined;
+	}
+
+	function anchorKey(a: {
+		oldStart: number;
+		oldLines: number;
+		newStart: number;
+		newLines: number;
+	}): string {
+		return `${a.oldStart}:${a.oldLines}:${a.newStart}:${a.newLines}`;
+	}
+
 	const ircApiService = inject(IRC_API_SERVICE);
 	const settingsService = inject(SETTINGS_SERVICE);
 	const settingsStore = settingsService.appSettings;
@@ -374,7 +459,30 @@
 	}
 
 	function filter(hunks: DiffHunk[]): SplitDiffHunk[] {
-		if (selectionId.type !== "worktree") return hunks.map((hunk) => ({ hunk }));
+		if (selectionId.type !== "worktree") {
+			// Phase 7c-5: commit-diff views receive sub-hunks already
+			// materialized by the backend's `tree_change_diffs_in_commit`
+			// pass. Pair each materialized hunk with its natural anchor
+			// (via the commit override-anchors query) so the split icon
+			// and un-split path can target the right key.
+			// Phase 7e: also pair each sub-hunk with its corresponding
+			// `RowRange` from the override (matched by per-anchor index in
+			// materialization order) so drag handlers can call
+			// `move_sub_hunk` / `uncommit_sub_hunk`.
+			if (commitId) {
+				const perAnchorIndex = new Map<string, number>();
+				return hunks.map((hunk) => {
+					const summary = findCommitNaturalAnchorSummary(hunk);
+					if (!summary) return { hunk };
+					const key = anchorKey(summary.anchor);
+					const idx = perAnchorIndex.get(key) ?? 0;
+					perAnchorIndex.set(key, idx + 1);
+					const subRange = summary.ranges[idx];
+					return { hunk, anchor: summary.anchor, subRange };
+				});
+			}
+			return hunks.map((hunk) => ({ hunk }));
+		}
 		// For each natural hunk, look at the assignments for this file and:
 		//   - if any whole-file (binary / too-large) assignment exists, keep the
 		//     natural hunk verbatim,
@@ -528,7 +636,7 @@
 					}}
 				/>
 			{:else}
-				{#each filteredHunks.slice(0, renderedHunkCount) as { hunk, anchor: subAnchor }, hunkIndex}
+				{#each filteredHunks.slice(0, renderedHunkCount) as { hunk, anchor: subAnchor, subRange }, hunkIndex}
 					{@const selection = uncommittedService.hunkCheckStatus(stackId, change.path, hunk)}
 					{@const [_, lineLocks] = getLineLocks(hunk, fileDependencies?.dependencies ?? [])}
 					{@const hunkId = generateHunkId(change.path, hunkIndex)}
@@ -545,6 +653,8 @@
 								stackId || null,
 								commitId,
 								selectionId,
+								subAnchor,
+								subRange,
 							),
 							disabled: !draggable,
 							chipType: "hunk",
@@ -571,7 +681,52 @@
 							colorBlindFriendly={$userSettings.colorBlindFriendly}
 							inlineUnifiedDiffs={$userSettings.inlineUnifiedDiffs}
 							selectable={isUncommittedChange}
-							onLineClick={undefined}
+							onLineClick={isCommitting
+								? (params) => {
+										// Phase 5 carve-out: in commit mode the popover-on-drag
+										// gesture is disabled (`onLineDragEnd={undefined}`),
+										// so a per-line click must still fall back to direct
+										// stage/unstage — otherwise commit-time line
+										// unselection silently no-ops and the partial commit
+										// captures the whole hunk.
+										if (params.oldLine === undefined && params.newLine === undefined)
+											return;
+										const lineId: LineId = {
+											oldLine: params.oldLine,
+											newLine: params.newLine,
+										};
+										const sel = uncommittedService
+											.hunkCheckStatus(stackId, change.path, hunk)
+											.current;
+										const lineIsSelected = sel.lines.some(
+											(s) => s.newLine === lineId.newLine && s.oldLine === lineId.oldLine,
+										);
+										const alreadyChecked =
+											sel.selected && (sel.lines.length === 0 || lineIsSelected);
+										if (alreadyChecked) {
+											const allLines: LineId[] = [];
+											const parsed = parseHunk(hunk.diff);
+											for (const section of parsed.contentSections) {
+												if (section.sectionType === SectionType.Context) continue;
+												for (const line of section.lines) {
+													allLines.push({
+														newLine: line.afterLineNumber,
+														oldLine: line.beforeLineNumber,
+													});
+												}
+											}
+											uncommittedService.uncheckLine(
+												stackId || null,
+												change.path,
+												hunk,
+												lineId,
+												allLines,
+											);
+										} else {
+											uncommittedService.checkLine(stackId || null, change.path, hunk, lineId);
+										}
+								  }
+								: undefined}
 							onChangeStage={(selected) => {
 								if (!selectable) return;
 								if (selected) {

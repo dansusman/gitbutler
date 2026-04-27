@@ -198,7 +198,8 @@
 					{#if !allInOneDiff}
 						<!-- Single-file mode: show selected file with header -->
 						{#if selectedChange}
-							{@const diffQuery = diffService.getDiff(projectId, selectedChange)}
+							{@const fdmCommitIdSelected = selectionId.type === "commit" ? selectionId.commitId : undefined}
+						{@const diffQuery = diffService.getDiff(projectId, selectedChange, fdmCommitIdSelected)}
 							{@const diffResponse = diffQuery.response}
 							{@const lineChangesStat =
 								diffResponse?.type === "Patch"
@@ -290,7 +291,8 @@
 							}}
 						>
 							{#snippet template(change, index)}
-								{@const diffQuery = diffService.getDiff(projectId, change)}
+								{@const fdmCommitIdAll = selectionId.type === "commit" ? selectionId.commitId : undefined}
+							{@const diffQuery = diffService.getDiff(projectId, change, fdmCommitIdAll)}
 								{@const diffData = diffQuery.response}
 								{@const isExecutable = isExecutableStatus(change.status)}
 								{@const patchData = diffData?.type === "Patch" ? diffData.subject : null}

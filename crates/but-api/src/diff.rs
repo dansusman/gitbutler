@@ -156,6 +156,61 @@ pub fn tree_change_diffs_in_commit(
     )))
 }
 
+/// Per-anchor summary returned by [`list_commit_override_anchors`]:
+/// the natural anchor [`HunkHeader`] plus the ordered
+/// [`RowRange`]s the override partitions the anchor into. The
+/// frontend pairs each materialized sub-hunk (output of
+/// [`tree_change_diffs_in_commit`]) with its corresponding range by
+/// index — both lists are in `(new_start, new_lines)` order.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitOverrideSummary {
+    /// The natural anchor whose hunk is split.
+    pub anchor: HunkHeader,
+    /// The override's stored row ranges, in order.
+    pub ranges: Vec<RowRange>,
+}
+
+/// Phase 7c-5 / 7e: returns one [`CommitOverrideSummary`] per
+/// commit-anchored sub-hunk override registered for `(commit_id,
+/// path)`.
+///
+/// The desktop calls this alongside [`tree_change_diffs_in_commit`]
+/// for two reasons:
+///   1. Identify which materialized hunks are sub-hunks (their row
+///      span is contained within an anchor's range) and which
+///      natural anchor to target on un-split.
+///   2. (Phase 7e) Recover the per-sub-hunk `RowRange` so the drag
+///      handlers can call [`commit::sub_hunk::move_sub_hunk`] /
+///      [`commit::sub_hunk::uncommit_sub_hunk`] without
+///      re-deriving row indices on the frontend.
+#[but_api(napi)]
+#[instrument(skip_all, err(Debug))]
+pub fn list_commit_override_anchors(
+    ctx: &Context,
+    commit_id: gix::ObjectId,
+    path: BString,
+) -> anyhow::Result<Vec<CommitOverrideSummary>> {
+    let gitdir = ctx.gitdir.clone();
+    let (_guard, _repo, _ws, db) = ctx.workspace_and_db()?;
+    but_hunk_assignment::ensure_hydrated(&db, &gitdir);
+    drop(db);
+    let mut summaries: Vec<CommitOverrideSummary> =
+        but_hunk_assignment::list_commit_overrides(&gitdir, commit_id)
+            .into_iter()
+            .filter(|ov| ov.path == path)
+            .map(|ov| CommitOverrideSummary {
+                anchor: ov.anchor,
+                ranges: ov.ranges,
+            })
+            .collect();
+    // Stable order matches `tree_change_diffs_in_commit`'s
+    // materialization order so the frontend can pair sub-hunks with
+    // ranges by index.
+    summaries.sort_by_key(|s| (s.anchor.new_start, s.anchor.new_lines));
+    Ok(summaries)
+}
+
 /// See [`changes_in_worktree_with_perm()`].
 #[but_api(napi)]
 #[instrument(err(Debug))]

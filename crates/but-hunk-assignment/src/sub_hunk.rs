@@ -1941,6 +1941,103 @@ pub fn reconcile_with_overrides_persistent(
     Ok(())
 }
 
+/// Phase 7f: migrate every `Commit { id: old_id, .. }`-keyed override
+/// onto the rewritten commit at `new_id`, using `new_commit_assignments`
+/// (synthetic `HunkAssignment`s built from the rewritten commit's
+/// first-parent diff) as the migration target.
+///
+/// For each affected override:
+///   1. Run [`migrate_override_multi`] against `new_commit_assignments`
+///      — the same content-match alignment used by Phase 4.5 for
+///      worktree anchors. Ranges that became all-context (i.e. the
+///      moved sub-range, which was committed/uncommitted out of the
+///      source commit) are dropped. Ranges that survive are remapped
+///      onto the new anchor's row space.
+///   2. Stamp each migrated entry's [`SubHunkOverride::origin`] with
+///      `Commit { id: new_id, path: ov.path }`.
+///   3. Write-through: delete the stale `(old_id, path, anchor)` row;
+///      upsert one row per migrated entry under the new commit id.
+///   4. If migration drops the override entirely (no candidates match,
+///      or every range collapsed to context), the stale row stays
+///      deleted and nothing is upserted.
+///
+/// Returns the number of overrides successfully migrated (i.e. the
+/// count of upserts written under `new_id`). Overrides on the same
+/// `(path, anchor)` that were dropped contribute zero.
+///
+/// Idempotent w.r.t. `(old_id, new_id)` because the in-memory entry
+/// is removed before the migrated entries are upserted under the new
+/// key.
+pub fn migrate_commit_overrides_persistent(
+    db: &mut but_db::DbHandle,
+    gitdir: &Path,
+    old_id: gix::ObjectId,
+    new_id: gix::ObjectId,
+    new_commit_assignments: &[HunkAssignment],
+) -> Result<usize> {
+    if old_id == new_id {
+        return Ok(0);
+    }
+    ensure_hydrated(db, gitdir);
+
+    let to_migrate: Vec<SubHunkOverride> = list_overrides_filtered(gitdir, |loc| {
+        loc.commit_id() == Some(old_id)
+    });
+    if to_migrate.is_empty() {
+        return Ok(0);
+    }
+
+    tracing::info!(
+        target: "sub_hunk",
+        old_id = %old_id,
+        new_id = %new_id,
+        count = to_migrate.len(),
+        "migrating commit-anchored overrides after commit rewrite",
+    );
+
+    let mut migrated_count = 0usize;
+    for ov in to_migrate {
+        let old_anchor = ov.anchor;
+        let old_location = SubHunkOriginLocation::commit(old_id, ov.path.clone());
+
+        let migrated = migrate_override_multi(&ov, new_commit_assignments);
+
+        // Always drop the stale entry first — whether migration
+        // succeeded or not, the (old_id, anchor) key no longer
+        // refers to a live commit.
+        remove_override_persistent_at(db, gitdir, &old_location, old_anchor)?;
+
+        if migrated.is_empty() {
+            tracing::info!(
+                target: "sub_hunk",
+                old_id = %old_id,
+                new_id = %new_id,
+                path = %ov.path,
+                anchor = ?old_anchor,
+                "commit override migration: no surviving ranges; dropped",
+            );
+            continue;
+        }
+
+        for (_idx, mut m) in migrated {
+            m.origin = SubHunkOriginLocation::commit(new_id, m.path.clone());
+            tracing::info!(
+                target: "sub_hunk",
+                old_id = %old_id,
+                new_id = %new_id,
+                path = %m.path,
+                old_anchor = ?old_anchor,
+                new_anchor = ?m.anchor,
+                ranges = ?m.ranges,
+                "commit override migrated",
+            );
+            upsert_override_persistent(db, gitdir, m)?;
+            migrated_count += 1;
+        }
+    }
+    Ok(migrated_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4005,5 +4102,195 @@ mod tests {
             restored.origin,
             SubHunkOriginLocation::Worktree { .. }
         ));
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 7f — override migration on commit rewrite.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn migrate_commit_overrides_rekeys_to_new_commit_when_anchor_unchanged() {
+        // Setup: a commit-keyed override on `old_id` whose anchor's
+        // hunk shape is preserved into `new_id`. Migration should
+        // rekey the override to `new_id` and write through to disk.
+        let gitdir = fresh_gitdir("7f-rekey");
+        clear_store_for_tests_at(Some(&gitdir));
+        let mut db = fresh_db();
+
+        let old_id = fixed_commit(b'a');
+        let new_id = fixed_commit(b'b');
+        let path = BString::from("src/foo.rs");
+        let kinds = parse_row_kinds(&sample_diff());
+        let user_range = RowRange { start: 1, end: 5 };
+        let ranges = materialize_residual_ranges(&[user_range], &kinds);
+
+        let ov = SubHunkOverride {
+            origin: SubHunkOriginLocation::commit(old_id, path.clone()),
+            path: path.clone(),
+            anchor: anchor(),
+            ranges,
+            assignments: BTreeMap::new(),
+            rows: kinds,
+            anchor_diff: sample_diff(),
+        };
+        upsert_override_persistent(&mut db, &gitdir, ov.clone()).unwrap();
+
+        // The new commit's diff carries the same anchor at the same
+        // shape — mirrors the case where a commit was rewritten but
+        // *this particular hunk* was not touched (e.g. a sibling
+        // hunk on a different file was moved out).
+        let new_assignments = vec![HunkAssignment {
+            id: None,
+            hunk_header: Some(anchor()),
+            path: "src/foo.rs".to_string(),
+            path_bytes: path.clone(),
+            stack_id: None,
+            branch_ref_bytes: None,
+            line_nums_added: None,
+            line_nums_removed: None,
+            diff: Some(sample_diff()),
+            sub_hunk_origin: None,
+        }];
+
+        let migrated_count = migrate_commit_overrides_persistent(
+            &mut db,
+            &gitdir,
+            old_id,
+            new_id,
+            &new_assignments,
+        )
+        .unwrap();
+        assert_eq!(migrated_count, 1);
+
+        // Old key is gone.
+        assert!(get_commit_override(&gitdir, old_id, &path, anchor()).is_none());
+        // New key carries the same data.
+        let migrated = get_commit_override(&gitdir, new_id, &path, anchor())
+            .expect("override rekeyed to new_id");
+        assert_eq!(migrated.anchor, ov.anchor);
+        assert_eq!(migrated.ranges, ov.ranges);
+        assert!(matches!(
+            migrated.origin,
+            SubHunkOriginLocation::Commit { id, .. } if id == new_id
+        ));
+
+        // Disk state matches.
+        let key = gitdir_key(&gitdir);
+        let rows = db.sub_hunk_overrides().list_for_gitdir(&key).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].commit_id, new_id.as_bytes().to_vec());
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn migrate_commit_overrides_drops_when_anchor_missing_in_new_commit() {
+        // Setup: a commit-keyed override on `old_id`. The new commit's
+        // diff has nothing on the same path — e.g. the entire file
+        // was moved out of the source commit. Migration should drop
+        // the override.
+        let gitdir = fresh_gitdir("7f-drop");
+        clear_store_for_tests_at(Some(&gitdir));
+        let mut db = fresh_db();
+
+        let old_id = fixed_commit(b'1');
+        let new_id = fixed_commit(b'2');
+        let path = BString::from("src/foo.rs");
+        let kinds = parse_row_kinds(&sample_diff());
+        let ranges = materialize_residual_ranges(&[RowRange { start: 1, end: 5 }], &kinds);
+
+        let ov = SubHunkOverride {
+            origin: SubHunkOriginLocation::commit(old_id, path.clone()),
+            path: path.clone(),
+            anchor: anchor(),
+            ranges,
+            assignments: BTreeMap::new(),
+            rows: kinds,
+            anchor_diff: sample_diff(),
+        };
+        upsert_override_persistent(&mut db, &gitdir, ov).unwrap();
+
+        let migrated_count = migrate_commit_overrides_persistent(
+            &mut db,
+            &gitdir,
+            old_id,
+            new_id,
+            /* no candidates */ &[],
+        )
+        .unwrap();
+        assert_eq!(migrated_count, 0);
+
+        // Both keys are gone.
+        assert!(get_commit_override(&gitdir, old_id, &path, anchor()).is_none());
+        assert!(get_commit_override(&gitdir, new_id, &path, anchor()).is_none());
+        let key = gitdir_key(&gitdir);
+        assert!(db.sub_hunk_overrides().list_for_gitdir(&key).unwrap().is_empty());
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn migrate_commit_overrides_skips_unaffected_origins() {
+        // Setup: two overrides keyed on different (commit_id, path)
+        // pairs. Only the one matching `old_id` should be touched.
+        let gitdir = fresh_gitdir("7f-skip");
+        clear_store_for_tests_at(Some(&gitdir));
+        let mut db = fresh_db();
+
+        let old_id = fixed_commit(b'a');
+        let new_id = fixed_commit(b'b');
+        let untouched_id = fixed_commit(b'c');
+        let path = BString::from("src/foo.rs");
+        let kinds = parse_row_kinds(&sample_diff());
+        let ranges = materialize_residual_ranges(&[RowRange { start: 1, end: 5 }], &kinds);
+
+        let migrating = SubHunkOverride {
+            origin: SubHunkOriginLocation::commit(old_id, path.clone()),
+            path: path.clone(),
+            anchor: anchor(),
+            ranges: ranges.clone(),
+            assignments: BTreeMap::new(),
+            rows: kinds.clone(),
+            anchor_diff: sample_diff(),
+        };
+        let untouched = SubHunkOverride {
+            origin: SubHunkOriginLocation::commit(untouched_id, path.clone()),
+            path: path.clone(),
+            anchor: anchor(),
+            ranges,
+            assignments: BTreeMap::new(),
+            rows: kinds,
+            anchor_diff: sample_diff(),
+        };
+        upsert_override_persistent(&mut db, &gitdir, migrating).unwrap();
+        upsert_override_persistent(&mut db, &gitdir, untouched).unwrap();
+
+        let new_assignments = vec![HunkAssignment {
+            id: None,
+            hunk_header: Some(anchor()),
+            path: "src/foo.rs".to_string(),
+            path_bytes: path.clone(),
+            stack_id: None,
+            branch_ref_bytes: None,
+            line_nums_added: None,
+            line_nums_removed: None,
+            diff: Some(sample_diff()),
+            sub_hunk_origin: None,
+        }];
+
+        let migrated_count = migrate_commit_overrides_persistent(
+            &mut db,
+            &gitdir,
+            old_id,
+            new_id,
+            &new_assignments,
+        )
+        .unwrap();
+        assert_eq!(migrated_count, 1);
+
+        // The untouched override is still keyed under `untouched_id`.
+        assert!(get_commit_override(&gitdir, untouched_id, &path, anchor()).is_some());
+        // The migrated override moved from `old_id` to `new_id`.
+        assert!(get_commit_override(&gitdir, old_id, &path, anchor()).is_none());
+        assert!(get_commit_override(&gitdir, new_id, &path, anchor()).is_some());
+        clear_store_for_tests_at(Some(&gitdir));
     }
 }

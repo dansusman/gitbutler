@@ -617,6 +617,18 @@ export class StackService {
 		});
 	}
 
+	// Phase 7e: sub-hunk move / uncommit. Routes through the backend
+	// `move_sub_hunk` / `uncommit_sub_hunk` RPCs which encode the
+	// `(anchor, range)` pair into the null-side `HunkHeader` form
+	// `to_additive_hunks` consumes.
+	get moveSubHunk() {
+		return this.backendApi.endpoints.moveSubHunk.mutate;
+	}
+
+	get uncommitSubHunk() {
+		return this.backendApi.endpoints.uncommitSubHunk.mutate;
+	}
+
 	get stashIntoBranch() {
 		return this.backendApi.endpoints.stashIntoBranch.mutate;
 	}

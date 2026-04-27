@@ -778,6 +778,23 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .route("/assign_hunk", but_post(diff::assign_hunk_cmd))
         .route("/split_hunk", but_post(diff::split_hunk_cmd))
         .route("/unsplit_hunk", but_post(diff::unsplit_hunk_cmd))
+        // Phase 7c–7e: commit-anchored sub-hunk operations.
+        .route(
+            "/tree_change_diffs_in_commit",
+            but_post(diff::tree_change_diffs_in_commit_cmd),
+        )
+        .route(
+            "/split_hunk_in_commit",
+            but_post(diff::split_hunk_in_commit_cmd),
+        )
+        .route(
+            "/unsplit_hunk_in_commit",
+            but_post(diff::unsplit_hunk_in_commit_cmd),
+        )
+        .route(
+            "/list_commit_override_anchors",
+            but_post(diff::list_commit_override_anchors_cmd),
+        )
         .route(
             "/cherry_apply_status",
             but_post(legacy::cherry_apply::cherry_apply_status_cmd),
@@ -1157,6 +1174,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .route(
             "/commit_uncommit_changes",
             but_post(commit::uncommit::commit_uncommit_changes_cmd),
+        )
+        // Phase 7d–7e: sub-hunk move / uncommit.
+        .route(
+            "/move_sub_hunk",
+            but_post(commit::sub_hunk::move_sub_hunk_cmd),
+        )
+        .route(
+            "/uncommit_sub_hunk",
+            but_post(commit::sub_hunk::uncommit_sub_hunk_cmd),
         )
         .route("/commit_undo", but_post(commit::undo::commit_undo_cmd))
         .route("/build_type", but_post(platform::build_type_cmd));

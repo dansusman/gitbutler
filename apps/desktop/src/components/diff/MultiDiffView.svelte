@@ -107,7 +107,8 @@
 {/snippet}
 
 {#snippet changeItem(change: TreeChange, index?: number, highlight?: boolean)}
-	{@const diffQuery = diffService.getDiff(projectId, change)}
+	{@const commitIdForDiff = selectionId.type === "commit" ? selectionId.commitId : undefined}
+	{@const diffQuery = diffService.getDiff(projectId, change, commitIdForDiff)}
 	{@const diffData = diffQuery.response}
 	{@const isExecutable = isExecutableStatus(change.status)}
 	{@const patchData = diffData?.type === "Patch" ? diffData.subject : null}

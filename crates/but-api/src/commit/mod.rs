@@ -25,6 +25,10 @@ pub mod reword;
 /// Functions for squashing commits.
 pub mod squash;
 
+/// Phase 7d: functions for moving and uncommitting sub-ranges of a
+/// committed hunk.
+pub mod sub_hunk;
+
 /// Shared result and selector types for commit APIs.
 pub mod types;
 

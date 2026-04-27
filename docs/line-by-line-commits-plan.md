@@ -29,7 +29,7 @@ Last updated: end of "phase 5 polish + sub-hunk re-split + 6.5a" session.
 | 6.5d — Write-through on `split_hunk` / `unsplit_hunk` + read-path hydration in `changes_in_worktree_with_perm` | **Shipped (this session)** | _pending_ |
 | 6.5e — Size guard (`MAX_OVERRIDE_DB_BYTES = 64 KB`) | **Shipped (this session)** | _pending_ |
 | 6.5d-followup — Wire `reconcile_with_overrides_persistent` into `assignments_with_fallback` / `assign` (write-through on partial-commit migration / drops) | **Shipped (this session)** | _pending_ |
-| **7 — Splitting committed work + cross-stack moves of split pieces** | **In progress** (7a shipped this session) | _pending_ |
+| **7 — Splitting committed work + cross-stack moves of split pieces** | **In progress** (7a/7b/7c-1..5/7d/7e/7f/7g shipped) | _pending_ |
 | **⚠ Open: partial-commit content duplication on pure-add sub-hunks** | **Investigating** | — |
 
 ## What's validated end-to-end (manual GUI smoke test against `~/buttest`)
@@ -1923,3 +1923,729 @@ logic.
    to `splitHunkInCommit` when in a commit view.
 2. **Phase 7d** — `move_sub_hunk` / `uncommit_sub_hunk` RPCs.
 3. **Phase 7f** — override migration on commit rewrite.
+
+## What landed in the phase 7c-5 session
+
+### Phase 7c-5 — Frontend wiring for committed-hunk splits
+
+**Why this exists.** Phases 7a–7c-4 made the backend commit-aware:
+in-memory store, on-disk schema, `split_hunk_in_commit` /
+`unsplit_hunk_in_commit` RPCs, and an override-materializing
+`tree_change_diffs_in_commit` RPC. Until this session, none of that
+was reachable from the desktop — commit-diff views still went
+through the worktree-only `tree_change_diffs` and the popover's
+`Split` action was hard-disabled with a "Phase 7" tooltip. 7c-5
+threads `commitId` through the diff fetch + mutation path so the
+gesture, icon, and un-split affordances all light up for commit
+diffs.
+
+### One small backend addition
+
+The pre-shipped `tree_change_diffs_in_commit` returns the commit's
+patch with sub-hunks pre-sliced into separate `DiffHunk`s, but
+strips natural-anchor metadata in the process. The desktop needs
+the natural anchor for two things: the split-icon (so it can call
+`unsplit_hunk_in_commit`) and the popover's re-split path (so it
+can call `split_hunk_in_commit` against the underlying anchor
+rather than a sub-hunk). Rather than widen `UnifiedPatch`, this
+session added a focused query RPC:
+
+- `list_commit_override_anchors(ctx, commit_id, path) ->
+  Vec<HunkHeader>` in `crates/but-api/src/diff.rs`. Filters
+  `list_commit_overrides(gitdir, commit_id)` by `path` and emits
+  the `anchor` field of each override. Calls `ensure_hydrated`
+  for the same hydration parity as `tree_change_diffs_in_commit`.
+- Tauri allowlist + `main.rs` invoke list updated to match.
+
+The frontend uses the returned anchor list to detect which
+materialized hunks are sub-hunks (their row span is contained in
+exactly one anchor and not equal to it) and to recover the natural
+anchor for split / unsplit.
+
+### Frontend RTK endpoints
+
+`apps/desktop/src/lib/worktree/worktreeEndpoints.ts` gains four
+endpoints:
+
+- `getDiffInCommit({projectId, commitId, change}) -> UnifiedDiff |
+  null` → `tree_change_diffs_in_commit`. Provides
+  `ReduxTag.Diff`.
+- `listCommitOverrideAnchors({projectId, commitId, path: number[]})
+  -> HunkHeader[]` → `list_commit_override_anchors`. Provides
+  `ReduxTag.Diff` so a split / unsplit invalidation refetches both
+  the materialized diff and the anchor list in one tick.
+- `splitHunkInCommit({projectId, commitId, path, anchor, ranges})`
+  → `split_hunk_in_commit`. Invalidates `ReduxTag.Diff`.
+- `unsplitHunkInCommit({projectId, commitId, path, anchor})` →
+  `unsplit_hunk_in_commit`. Invalidates `ReduxTag.Diff`.
+
+### `DiffService` changes (`apps/desktop/src/lib/hunks/diffService.svelte.ts`)
+
+- `getDiff(projectId, change, commitId?)` and `fetchDiff(...,
+  commitId?)` now accept an optional `commitId`. When set, they
+  route to `getDiffInCommit`; otherwise the existing worktree
+  `getDiff` query.
+- New `listCommitOverrideAnchors(projectId, commitId, path)`
+  helper returning the live anchor query.
+- New `splitHunkInCommit` / `unsplitHunkInCommit` mutate
+  accessors mirroring the existing `splitHunk` / `unsplitHunk`
+  shape.
+- `getChanges` / `fetchChanges` (the file-list multi-diff fetch
+  used by the AI input pipeline) intentionally stays
+  worktree-only: those callers don't have `commitId` plumbed and
+  the existing mass-fetch path doesn't read commit-side overrides.
+
+### Parent diff fetchers thread `commitId`
+
+Three call sites passed `selectedFile.type === "commit" ?
+selectedFile.commitId : undefined` to `UnifiedDiffView` already;
+they now pass the same value to `diffService.getDiff` so the
+fetched patch is the override-materialized one:
+
+- `apps/desktop/src/components/diff/SelectionView.svelte`
+- `apps/desktop/src/components/diff/MultiDiffView.svelte`
+- `apps/desktop/src/components/diff/FloatingDiffModal.svelte`
+  (single-file mode + virtual-list mode, both branches)
+
+### `UnifiedDiffView.svelte` integration
+
+- New `commitOverrideAnchorsQuery` derived from
+  `diffService.listCommitOverrideAnchors(projectId, commitId,
+  pathToBytes(change.path))` whenever `commitId` is in scope. The
+  query lives alongside the existing `assignments` derivation and
+  is `undefined` for worktree views (no extra RPC traffic on the
+  worktree path).
+- New `findCommitNaturalAnchor(hunk)` helper: scans the override
+  anchor list for the unique anchor whose `(oldStart, oldLines,
+  newStart, newLines)` strictly contains `hunk`'s row span.
+  Returns the anchor as a plain literal so it can be stored into
+  the `SplitDiffHunk.anchor` slot without tripping Svelte 5's
+  `state_descriptors_fixed` runtime check on RTK-frozen objects.
+- `filter()` for `selectionId.type !== "worktree"` now branches:
+  - `commitId` set → tag each hunk with `subAnchor` via
+    `findCommitNaturalAnchor`. The pre-existing
+    `isSubHunk = subAnchor !== undefined` derivation in the
+    rendering loop wires the split icon and `onUnsplit` handler
+    automatically.
+  - No `commitId` (legacy "branch" selection or any other
+    non-worktree, non-commit surface) → existing pass-through
+    behavior.
+- `applySplitToSelection` and `handleUnsplit` route to
+  `splitHunkInCommit` / `unsplitHunkInCommit` when `commitId` is
+  set. The popover's gesture-layer validation
+  (`popoverSplitDisabled`) is unchanged for commit views — the
+  same context-only / whole-hunk rejections apply. The legacy
+  "(Phase 7)" tooltip is gone.
+- `subHunksHaveDivergentAssignments` is the worktree-side per-line
+  reassignment guard; commit-side un-split skips that confirm
+  prompt because commit-anchored sub-hunks don't carry per-line
+  stack reassignments today (Phase 7d adds the
+  `move_sub_hunk` flow that would put data behind that guard).
+
+### What's intentionally *not* shipped this session
+
+- **No Playwright spec.** Phase 5d's worktree happy-path is still
+  the priority; a commit-side variant should follow once 7d adds
+  drag-to-other-commit affordances so the spec covers a real
+  cross-surface workflow rather than just split + unsplit.
+- **No `move_sub_hunk` / `uncommit_sub_hunk` (Phase 7d).** The
+  drag-handler audit, RPC plumbing, and override-migration on
+  commit rewrite (7f) all stay open. With 7c-5 the user can
+  observe + register splits on committed hunks; the next session's
+  job is to make those splits movable.
+- **No commit-side `Discard change` parity.** The
+  `HunkContextMenu` discard path (Phase 5e polish) re-encodes
+  worktree sub-hunks via `diffToHunkHeaders(..., "discard")`. The
+  commit path's analog would presumably reuse the
+  `move_sub_hunk` machinery (uncommit-then-discard); deferring
+  with 7d.
+- **Anchor `pathToBytes` per-render call.** `findCommitNaturalAnchor`
+  is invoked per hunk per render; the byte conversion happens once
+  at the query-derivation layer. No memoization needed at
+  current diff sizes; revisit if the override count grows.
+
+### Backend tests
+
+No new tests this session — the RPC is a thin filter over the
+already-tested `list_commit_overrides` (3 tests in 7b) and
+`ensure_hydrated` (1 test in 6.5c). `cargo check -p but-api -p
+gitbutler-tauri` passes; full `but-api` + `but-hunk-assignment`
+test suites stay green at 93 + 134 (carried).
+
+### Frontend type check
+
+`pnpm check` in `apps/desktop`: my modified files
+(`UnifiedDiffView`, `SelectionView`, `MultiDiffView`,
+`FloatingDiffModal`, `diffService`, `worktreeEndpoints`) report
+zero errors. The 6 pre-existing errors in
+`ChangedFilesContextMenu.svelte` /
+`HunkContextMenu.svelte` /
+`AnnotationEditor.svelte` are unrelated and reproduce on
+`master`-equivalent baselines.
+
+### Manual smoke recipe (not yet run end-to-end)
+
+Against `~/buttest`:
+
+1. Identify a commit on a stack whose tree contains
+   `splittest_pure_add.md` (or any file with a multi-row hunk).
+2. Open the commit in the desktop diff view.
+3. Drag-select 2–3 rows inside one of the commit's hunks.
+4. Popover opens → click `Split`.
+5. The hunk re-renders as N sub-hunks, each with the split icon.
+6. Click the split icon on one sub-hunk → confirm — sub-hunks
+   collapse back into the natural anchor.
+7. `Cmd-Q`, relaunch via `pnpm dev:desktop`. Re-open the same
+   commit. Sub-hunks render with the same boundaries (Phase 6.5
+   hydration + Phase 7c-2 schema-v2 `commit_id` column carry the
+   state through).
+
+Items #4–#6 exercise the new RTK round-trip: `splitHunkInCommit`
+mutation invalidates `ReduxTag.Diff`, both the materialized diff
+query and the override-anchors query refetch, and the rendering
+loop sees the new hunks-with-anchors immediately. Item #7 exercises
+hydration — it should "just work" because Phase 7c-2 already
+plumbs the `commit_id` column through `to_db_row` /
+`from_db_row` and Phase 6.5c's `ensure_hydrated` is invoked from
+both the new `tree_change_diffs_in_commit` RPC and the new
+`list_commit_override_anchors` RPC.
+
+### Recommended next-session pickup
+
+1. **Phase 7d** — `move_sub_hunk` / `uncommit_sub_hunk` RPCs.
+   Wraps `move_changes_between_commits` / `uncommit_changes` for
+   sub-ranges via `encode_sub_hunk_for_commit`. Frontend drag
+   handlers (`commitDropHandler.ts` already re-encodes via
+   `diffToHunkHeaders("commit")`; the cross-commit move flow
+   needs the analog for sub-hunks).
+2. **Phase 7f** — override migration on commit rewrite. When a
+   source commit gets rewritten by 7d's flow, the
+   `Commit { id }`-keyed override on the source needs to migrate
+   to the rewritten commit id via the same content-match logic
+   Phase 4.5 used for the worktree case. Likely lives in
+   `migrate_stored_override_multi` with a commit-aware variant.
+3. **Phase 5d Playwright** — happy-path spec for the worktree
+   gesture (still on the open list from prior sessions). Now
+   that 7c-5 has shipped, the same spec shape can be cloned for
+   the commit-side surface in a follow-up.
+4. **Open partial-commit duplication issue** — still independent;
+   needs trace logging in `to_additive_hunks` /
+   `safe_checkout` to confirm whether sub-hunk encoding emits
+   overlapping null-side ranges. Higher leverage than further
+   polish.
+
+## What landed in the phase 7d session
+
+### Phase 7d — `move_sub_hunk` / `uncommit_sub_hunk` RPCs
+
+**Why this exists.** Phase 7c-1..5 made it possible to *register* and
+*render* commit-anchored sub-hunk overrides, but a sub-hunk was still
+not addressable as the unit of a `move_changes_between_commits` /
+`uncommit_changes` operation. The downstream workflow
+"drag a committed sub-range to another commit / back to the
+worktree" needed an encode step that resolves
+`(commit_id, path, anchor, range)` to a `DiffSpec` whose
+`hunk_headers` are the null-side per-row form
+[`but_core::tree::to_additive_hunks`] consumes. 7d adds that encode
+step and wires it through to two thin RPC wrappers around the
+existing move / uncommit pipelines.
+
+### What landed
+
+**New file: `crates/but-api/src/commit/sub_hunk.rs`.** Module
+exported via `commit::sub_hunk` (registered in `commit/mod.rs`). It
+owns one private helper and two RPCs:
+
+- **`encode_sub_hunk_diff_spec(ctx, commit_id, path, anchor, range)
+  -> Result<DiffSpec>`** (private). Resolves `commit_id`'s
+  first-parent diff via
+  [`but_core::diff::CommitDetails::from_commit_id`], finds the
+  hunk whose header matches `anchor`, parses row kinds via
+  [`but_hunk_assignment::sub_hunk::parse_row_kinds`], trims the
+  `range` of leading/trailing context, validates it via
+  [`but_hunk_assignment::sub_hunk::validate_ranges`], and emits
+  the encoded headers via
+  [`but_hunk_assignment::encode_sub_hunk_for_commit`]. The
+  resulting `DiffSpec` carries the original `previous_path` so
+  rename-aware moves work out of the box.
+- **`move_sub_hunk(ctx, source_commit_id, destination_commit_id,
+  path, anchor, range, dry_run)`** plus `_with_perm` variant.
+  Encodes the sub-range, then forwards a single-element
+  `Vec<DiffSpec>` to
+  `commit_move_changes_between_with_perm`. The remainder of
+  the source hunk stays at the source commit; the rewritten
+  source's tree omits exactly the rows in `range`. `dry_run`
+  flows through the existing pipeline so the popover / drag
+  preview can re-use the same code path before commit.
+- **`uncommit_sub_hunk(ctx, commit_id, path, anchor, range,
+  assign_to, dry_run)`** plus `_with_perm` variant. Same shape
+  but forwards to `commit_uncommit_changes_with_perm`. The
+  `assign_to: Option<StackId>` plumbing is preserved from the
+  underlying RPC, so the desktop can route the surfaced rows
+  to whichever stack initiated the drag.
+
+**Tauri allowlist + `main.rs`**: both new commands registered. The
+permissions list places `"move_sub_hunk"` next to `"move_branch"`
+and `"uncommit_sub_hunk"` next to the existing `"unsplit_hunk*"`
+entries to keep the alphabetical block coherent.
+
+### What's intentionally *not* shipped this session
+
+- **No frontend wiring.** That's Phase 7e: drag handlers in
+  `commitDropHandler.ts` (the analog of the existing
+  `AmendCommitWithHunkDzHandler` re-encoding via
+  `diffToHunkHeaders("commit")`), source/destination invalidation
+  tags so RTK refreshes both sides of a cross-commit move, and
+  origin-aware drag data so the destination handler knows the
+  dragged piece is a sub-hunk.
+- **No override migration on commit rewrite (Phase 7f).** A
+  `Commit { id: source, path }`-keyed override on the source
+  commit goes stale immediately after a successful move because
+  the rebase produces a new commit id. The next commit-diff
+  render against the rewritten commit will see no sub-hunks until
+  the user re-splits. Documented inline on both RPCs. Closing
+  this loop is 7f's job and uses the same content-match
+  migration logic Phase 4.5 introduced for the worktree case
+  (`migrate_override_multi`), with a commit-aware variant keyed
+  off the rebase's commit-id mapping.
+- **No tests.** Both wrappers are pure plumbing over
+  already-tested primitives:
+  `encode_sub_hunk_for_commit` (covered in
+  `crates/but-hunk-assignment/src/sub_hunk.rs::tests` —
+  `encode_sub_hunk_for_commit_*` group),
+  `commit_move_changes_between_with_perm` /
+  `commit_uncommit_changes_with_perm` (covered by the
+  workspace-level rebase suites in
+  `crates/but-workspace/tests/commit/`). The neighboring
+  `move_changes.rs` and `uncommit.rs` files in `but-api` are
+  also untested at the unit level — the precedent is to cover
+  these wrappers from the desktop / integration side. Phase 7g's
+  Playwright spec will exercise the full move flow.
+
+### Verification
+
+- `cargo check -p but-api -p gitbutler-tauri` — clean.
+- `cargo test -p but-api -p but-hunk-assignment` — 93 +
+  carry-over, all green; 7d adds no tests but breaks none.
+
+### Recommended next-session pickup
+
+1. **Phase 7e** — frontend drag handlers. Audit every
+   `DiffSpec`-construction site in `commitDropHandler.ts` and
+   route sub-hunk drags through a new encoder that calls
+   `move_sub_hunk` / `uncommit_sub_hunk` instead of the
+   natural-hunk variants. The drag data (`HunkDropDataV3`)
+   already carries the source `commitId`; what's missing is a
+   way for the destination handler to discriminate
+   "natural-hunk drag" from "sub-hunk drag" — probably via the
+   `subAnchor`/natural-anchor pair Phase 7c-5 surfaced through
+   `findCommitNaturalAnchor`. The popover's drag-friendly
+   wrapper may need a small extension so the dragged sub-hunk
+   carries `range: RowRange` end-to-end.
+2. **Phase 7f** — override migration on source-commit rewrite.
+   Hook the existing rebase-mapping output (the
+   `commit_mappings` already returned by `MoveChangesResult`)
+   into a new `migrate_commit_override_multi(...)` pass that:
+   - Looks up every `Commit { id: source }`-keyed override.
+   - For each, locates the rewritten commit id via the mapping.
+   - Runs the existing content-match migration to remap row
+     indices and drop ranges that became all-context (i.e. the
+     moved sub-range).
+   - Write-throughs via `upsert_override_persistent` /
+     `remove_override_persistent_at`.
+   This closes the user-visible "split state vanishes after a
+   move" gap and removes the Phase 7d caveat.
+3. **Phase 7g** — Playwright happy-path spec covering: open a
+   commit, split a hunk, drag a sub-hunk to another commit,
+   verify both rewritten commits are correct, verify the
+   remaining sub-hunks on the source still render with the
+   split icon (validates 7f).
+4. **Phase 5d Playwright** for the worktree-side gesture, still
+   open from prior sessions.
+
+## What landed in the phase 7e session
+
+### Phase 7e — Frontend drag handlers for committed sub-hunks
+
+**Why this exists.** Phase 7d shipped the `move_sub_hunk` /
+`uncommit_sub_hunk` RPCs but no frontend caller invoked them. A user
+who split a committed hunk in 7c-5 and dragged a sub-hunk to another
+commit (or to the worktree's "uncommit zone") still flowed through
+the natural-hunk move/uncommit pipeline, which rejected the
+synthesized sub-hunk header with a "Missing diff spec association"
+error. 7e wires the drag handlers to recognize sub-hunks and route
+them through the new RPCs, completing the committed-hunk
+"split → move/uncommit" loop end-to-end.
+
+### Backend: enrich the commit-overrides RPC return shape
+
+Phase 7c-5's `list_commit_override_anchors` returned just the
+natural anchor `HunkHeader[]`. The drag handlers also need the
+per-sub-hunk `RowRange` so the new RPCs can be called without
+re-deriving row indices on the frontend. The RPC return type
+widened to `Vec<CommitOverrideSummary>`:
+
+```rust
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitOverrideSummary {
+    pub anchor: HunkHeader,
+    pub ranges: Vec<RowRange>,
+}
+```
+
+Sorted by `(anchor.new_start, anchor.new_lines)` so the frontend
+can pair sub-hunks (already in materialization order from
+`tree_change_diffs_in_commit`) with `ranges[i]` by index.
+
+### Frontend: mutations and helpers
+
+`apps/desktop/src/lib/stacks/stackEndpoints.ts`:
+
+- `moveSubHunk` mutation → `move_sub_hunk` command. Invalidates
+  `HeadSha`, `WorktreeChanges`, `CommitChanges`, `Diff`.
+- `uncommitSubHunk` mutation → `uncommit_sub_hunk`. Invalidates
+  `HeadSha`, `WorktreeChanges`, `BranchChanges`, `Diff`.
+
+`apps/desktop/src/lib/stacks/stackService.svelte.ts`:
+
+- `get moveSubHunk()` and `get uncommitSubHunk()` accessor
+  pattern, mirroring the existing `get assignHunk` /
+  `get splitHunk` style.
+
+`apps/desktop/src/lib/worktree/worktreeEndpoints.ts`:
+
+- `listCommitOverrideAnchors` return type updated from
+  `HunkHeader[]` to `CommitOverrideSummary[]`. The `RowRange`
+  type alias (already used by `splitHunk`) is reused unchanged;
+  `CommitOverrideSummary` is exported alongside.
+
+### Frontend: drag-data plumbing
+
+`apps/desktop/src/lib/dragging/draggables.ts`:
+
+- `HunkDropDataV3` extended with two optional trailing
+  constructor params:
+  - `subAnchor: HunkHeader | undefined` — the natural anchor of
+    the source sub-hunk (when applicable).
+  - `subRange: { start: number; end: number } | undefined` — the
+    row range the override partitions out for this sub-hunk.
+- Both default to `undefined`, so existing call sites that didn't
+  pass them (the default `HunkDropDataV3` constructor in the
+  worktree path) compile unchanged.
+
+### Frontend: UnifiedDiffView pairs sub-hunks with their ranges
+
+`apps/desktop/src/components/diff/UnifiedDiffView.svelte`:
+
+- `findCommitNaturalAnchor` renamed to
+  `findCommitNaturalAnchorSummary` and returns
+  `{ anchor, ranges }`.
+- `filter()`'s commit branch now maintains a per-anchor counter
+  (`Map<anchorKey, number>`) and assigns `subRange =
+  ranges[idx]` for the i-th materialized sub-hunk inside the
+  same anchor. Returned `SplitDiffHunk[]` carries the new
+  optional `subRange` field on each sub-hunk row.
+- The `{#each filteredHunks ... as { hunk, anchor: subAnchor,
+  subRange }}` rendering loop unpacks the new field and passes
+  it to the `HunkDropDataV3` constructor alongside `subAnchor`.
+- `SplitDiffHunk` (in `apps/desktop/src/lib/hunks/hunk.ts`) gained
+  the optional `subRange` field with a doc comment pointing at
+  Phase 7e.
+
+### Frontend: drop handlers route sub-hunks to the new RPCs
+
+`apps/desktop/src/lib/dragging/dropHandlers/commitDropHandler.ts`:
+
+- **`UncommitDzHandler.ondrop`** (`HunkDropDataV3` branch): if
+  `data.subAnchor && data.subRange`, calls
+  `stackService.uncommitSubHunk({commitId, path, anchor,
+  range, assignTo, dryRun})`. Falls through to the existing
+  natural-hunk `uncommitChanges` path otherwise.
+- **`AmendCommitWithHunkDzHandler.ondrop`** (committed-source
+  branch — `!data.uncommitted`): same shape, calls
+  `stackService.moveSubHunk({sourceCommitId,
+  destinationCommitId, path, anchor, range, dryRun})` for
+  sub-hunks. Worktree-source amend (`data.uncommitted`) and
+  natural-hunk move stay on the existing pipelines.
+- Both branches capture `subAnchor` / `subRange` into local
+  consts before the `withStackBusy` closure to preserve TS
+  narrowing across the closure boundary.
+
+### What's intentionally *not* shipped this session
+
+- **No override migration on commit rewrite (Phase 7f).** The
+  source commit's override goes stale immediately after a
+  successful sub-hunk move because the rebase produces a new
+  commit id. The user's split state vanishes from the rewritten
+  commit's diff view until they re-split. Inline comments on
+  both new drag branches point at 7f as the closer; the underlying
+  RPCs already document the same caveat.
+- **No drag preview / dry-run plumbing.** Both drag handlers
+  call the new RPCs with `dryRun: false`. The existing natural
+  hunk paths also default to `false`; if a future iteration adds
+  drag-time preview, sub-hunks should follow the same pattern via
+  the RPC's existing `dry_run: DryRun` parameter.
+- **No `AmendCommitWithChangeDzHandler` / file-drag paths.** Those
+  paths already amend whole files / changes, not sub-hunks.
+  Nothing to wire; they pass through unchanged.
+- **No tests.** The new mutations and drop branches are pure
+  plumbing over already-tested primitives:
+  - `move_sub_hunk` / `uncommit_sub_hunk` RPCs (Phase 7d) are
+    thin wrappers over already-tested
+    `commit_move_changes_between` / `commit_uncommit_changes`.
+  - `CommitOverrideSummary` is a serde-only type widening of
+    `HunkHeader[]` → `Vec<{anchor, ranges}>`; the underlying
+    `list_commit_overrides` is covered by the 7b tests.
+  - The drag/drop pipeline doesn't have a unit-test scaffold in
+    the desktop today; coverage will land via Phase 7g's
+    Playwright spec once 7f closes the override-migration gap
+    so the spec can verify the rewritten commit's split state.
+
+### Verification
+
+- `cargo check -p but-api -p gitbutler-tauri` (default + `--features napi`)
+  — clean.
+- `cargo test -p but-api -p but-hunk-assignment` — 93 + carry-over,
+  all green.
+- `pnpm check` in `apps/desktop` — my modified files
+  (`UnifiedDiffView`, `commitDropHandler`, `draggables`,
+  `worktreeEndpoints`, `stackEndpoints`, `stackService`, `hunk.ts`)
+  report zero errors. The 6 pre-existing errors in
+  `ChangedFilesContextMenu` / `HunkContextMenu` /
+  `AnnotationEditor` are unrelated and reproduce on
+  `master`-equivalent baselines.
+
+### Manual smoke recipe
+
+Against `~/buttest`, with two stacks `A` and `B`:
+
+1. Open a commit on stack `A` whose tree contains a multi-row
+   hunk. Drag-select 2–3 rows inside the hunk → popover opens →
+   click `Split`. The hunk re-renders as N sub-hunks with the
+   split icon (Phase 7c-5).
+2. Drag the middle sub-hunk's chip onto a commit on stack `B`'s
+   amend-target dropzone. Stack `B`'s rewritten commit should
+   contain exactly the moved rows; stack `A`'s rewritten commit
+   should be missing exactly those rows.
+3. Re-open stack `A`'s rewritten commit. With Phase 7f deferred,
+   the remaining sub-hunks won't render as split (their override
+   is anchored to the *pre-rewrite* commit id). User can re-split
+   if desired; Phase 7f closes this loop automatically.
+4. Drag a sub-hunk to the worktree's uncommit dropzone instead.
+   The rows reappear as worktree changes, optionally assigned to
+   the source stack via `assign_to`.
+
+### Recommended next-session pickup
+
+1. **Phase 7f** — override migration on source-commit rewrite.
+   `move_sub_hunk` / `uncommit_sub_hunk` already return a
+   `MoveChangesResult` whose `workspace.replacedCommits` is the
+   `old_id → new_id` map. After the mutation, walk every
+   `Commit { id: old_id, path }`-keyed override, run
+   `migrate_override_multi`-style content matching against the
+   *new* commit's diff (same logic Phase 4.5 used for worktree
+   anchors), drop ranges that became all-context (i.e. the moved
+   sub-range itself), and rekey survivors to `Commit { id: new_id }`.
+   Worktree-side migration can be reused almost verbatim — only
+   the key axis changes. Write-through via
+   `upsert_override_persistent` /
+   `remove_override_persistent_at`.
+2. **Phase 7g** — Playwright happy-path: open commit, split,
+   drag sub-hunk to another commit, verify rewritten commits and
+   surviving split state on the source (validates 7f).
+3. **Phase 5d Playwright** worktree-side spec, still open from
+   prior sessions.
+4. **Open partial-commit duplication issue** — independent of
+   phase 7; pure backend trace-driven debugging.
+
+## What landed in the phase 7f / 7g session
+
+### Phase 7f — Override migration on source-commit rewrite
+
+**Why this exists.** Phase 7d / 7e wired up `move_sub_hunk` /
+`uncommit_sub_hunk` and the drag handlers, but a successful sub-hunk
+move always rewrote the source commit and orphaned its
+`Commit { id: source }`-keyed override on the *old* commit id.
+Re-opening the rewritten commit's diff would render it as a single
+natural hunk — the user's split state silently vanished. 7f closes
+that loop: every move/uncommit now migrates the override store onto
+the rewritten commit id via a content-match alignment.
+
+### Backend
+
+`crates/but-hunk-assignment/src/sub_hunk.rs`:
+
+- New public helper
+  `migrate_commit_overrides_persistent(db, gitdir, old_id, new_id,
+  &[HunkAssignment]) -> Result<usize>`. For every
+  `Commit { id: old_id }`-keyed override:
+  1. Run `migrate_override_multi` against the supplied
+     `new_commit_assignments` (synthetic `HunkAssignment`s built
+     from the rewritten commit's first-parent diff). Same
+     content-match alignment Phase 4.5 introduced for worktree
+     anchors — ranges that became all-context (i.e. the moved
+     sub-range itself) are dropped, ranges that survive get
+     remapped onto the new anchor's row space.
+  2. Stamp each migrated entry's
+     [`SubHunkOverride::origin`] with `Commit { id: new_id, path }`.
+  3. Write-through: delete the stale `(old_id, anchor)` row;
+     upsert one row per migrated entry under the new commit id.
+  4. If migration drops the override entirely (no candidates match,
+     or every range collapsed to context), the stale row stays
+     deleted and nothing is upserted.
+  Returns the count of overrides successfully migrated under
+  `new_id`. Exported via the crate root.
+
+`crates/but-api/src/commit/sub_hunk.rs`:
+
+- New helper `commit_diff_assignments(repo, commit_id,
+  context_lines)` that walks the rewritten commit's
+  first-parent diff and constructs synthetic
+  `HunkAssignment`s (path, header, diff body — everything else
+  defaulted) for the migration helper to align against.
+- New helper `migrate_overrides_after_rewrite(ctx, result, perm)`
+  that walks `result.workspace.replaced_commits` and calls
+  `migrate_commit_overrides_persistent` for each non-no-op
+  `(old_id, new_id)` pair. Errors during migration are logged
+  via `tracing::warn!` and swallowed — the move/uncommit itself
+  already succeeded and a migration failure should not be
+  surfaced as an RPC error.
+- `move_sub_hunk_with_perm` and `uncommit_sub_hunk_with_perm`
+  now call `migrate_overrides_after_rewrite` after the
+  underlying move / uncommit returns successfully (skipped on
+  `dry_run`).
+
+### Tests (3 new, 96 total in `but-hunk-assignment`)
+
+- `migrate_commit_overrides_rekeys_to_new_commit_when_anchor_unchanged`
+  — happy path: hunk shape preserved into the new commit; the
+  override is rekeyed to `new_id` with identical anchor / ranges
+  and the disk row gains the new `commit_id` blob.
+- `migrate_commit_overrides_drops_when_anchor_missing_in_new_commit`
+  — entire path absent from the new commit's diff; the override
+  is dropped from both layers.
+- `migrate_commit_overrides_skips_unaffected_origins` — two
+  overrides on different `(commit_id, path)` keys; only the one
+  matching `old_id` is touched.
+
+### What's *not* in 7f (still open)
+
+- **Migration only fires from `move_sub_hunk` / `uncommit_sub_hunk`.**
+  Other commit-rewriting RPCs — `commit_amend`,
+  `commit_squash`, `commit_reword`, `commit_undo`, `edit-mode`
+  flows — still leave commit-keyed overrides stale on rewritten
+  commits. The migration helper is generic enough to be called
+  from any of those; wiring is pure plumbing once we decide
+  whether to centralize on a single post-rewrite hook (in the
+  rebase pipeline) or scatter explicit calls. Punt to 7h.
+- **Migration runs synchronously inside the move RPC.** For
+  large commits with many overrides on many paths the migration
+  walks every override and computes a new patch per (path,
+  hunk). Acceptable for v1; revisit if profiling shows it as the
+  dominant cost.
+
+### Phase 7g — Playwright happy-path
+
+`e2e/playwright/tests/committedSubHunkSplit.spec.ts` (new file,
+1 test): exercises the full commit-side split → un-split round-trip
+via the popover gesture.
+
+1. Make a multi-row hunk in a brand-new commit on a fresh stack.
+2. Click the commit-row to open its details, then click the file
+   inside the expanded `.changed-files-container` to surface the
+   unified diff view.
+3. Drag-select the middle two added rows → selection popover
+   opens, `Split` action is enabled (Phase 7c-5 lifted the
+   "(Phase 7)" gate).
+4. Click `Split` → `tree_change_diffs_in_commit` and
+   `list_commit_override_anchors` re-fetch under the
+   `Diff`-tagged invalidation; the diff renders with N>1 hunk
+   header bars and at least one `unsplit-sub-hunk-button`.
+5. Click the un-split icon → the override is removed and the
+   hunks collapse back to a single natural one.
+
+This validates the
+`tree_change_diffs_in_commit` + `list_commit_override_anchors` +
+`split_hunk_in_commit` + `unsplit_hunk_in_commit` round-trip
+end-to-end against the dev-mode `but-server` HTTP backend.
+
+### Supporting changes (pre-existing pickup)
+
+- **`but-server` route registrations.** The dev-mode HTTP server
+  hadn't shipped routes for any of Phase 7's RPCs, so the
+  Playwright suite (which runs against `but-server`, not Tauri)
+  would 404 on `tree_change_diffs_in_commit` /
+  `split_hunk_in_commit` / `unsplit_hunk_in_commit` /
+  `list_commit_override_anchors` / `move_sub_hunk` /
+  `uncommit_sub_hunk`. Added all six route registrations in
+  `crates/but-server/src/lib.rs`; the `_cmd` variants are
+  generated by `but_api(napi)` so no per-RPC plumbing was
+  needed.
+- **`unsplit-sub-hunk-button` test ID** in
+  `packages/ui/src/lib/utils/testIds.ts` +
+  `packages/ui/src/lib/components/hunkDiff/HunkDiff.svelte`,
+  so 7g (and the worktree-side existing tests) can target the
+  un-split affordance without relying on aria-label or class
+  selectors. `pnpm package` re-runs needed in `packages/ui`
+  after the change.
+
+### Phase 5 regression fixed in passing
+
+The pre-existing
+`tests/unifiedDiffView.spec.ts::"complex file"` test was already
+failing on master before this session — Phase 5's popover
+rewrite hardcoded `onLineClick={undefined}` *and* disabled
+`onLineDragEnd` in commit mode (`!isCommitting ? ... :
+undefined`), leaving line-gutter clicks doing nothing during a
+partial commit. The result was that the `unselectHunkLines`
+helper in the test silently no-op'd and the resulting commit
+captured the whole file (`hunkHeaders: []` in the
+`commit_create` payload).
+
+Fix in `apps/desktop/src/components/diff/UnifiedDiffView.svelte`:
+restore an `onLineClick` handler in commit mode that toggles per-line
+staging directly via `uncommittedService.checkLine` /
+`uncheckLine` — same logic the popover's Stage button uses, but
+without the popover round-trip. The carve-out is only applied when
+`isCommitting` is true; the popover-on-click behavior for the
+worktree case is preserved.
+
+### Verification (full session)
+
+- `cargo check -p but-api -p gitbutler-tauri -p but-server` clean
+  (default features and `--features napi` for `but-api`).
+- `cargo test -p but-api -p but-hunk-assignment -p but-db -p
+  but-core -p but-server` — all green; 96 tests in
+  `but-hunk-assignment` (3 new), 133 in `but-db`, 136 in
+  `but-core`, 5 in `but-api`, 10 in `but-server`.
+- `pnpm test` in `apps/desktop` — 311 unit tests passing.
+- `pnpm check` — only pre-existing unrelated errors in
+  `ChangedFilesContextMenu`, `HunkContextMenu`,
+  `AnnotationEditor`.
+- **Playwright e2e** — full suite **59 / 59 passing** in webkit
+  (was 58/59 with the pre-existing `unifiedDiffView`
+  partial-commit failure; now fixed). Includes the new
+  `committedSubHunkSplit` spec.
+
+### Recommended next-session pickup
+
+1. **Phase 7h** — extend Phase 7f's migration call to all other
+   commit-rewriting RPCs (`commit_amend`, `commit_squash`,
+   `commit_reword`, `commit_undo`, edit-mode commit flows). The
+   helper already exists; the work is identifying the right
+   post-rewrite hook (probably centralize on the rebase
+   pipeline's `replaced_commits` mapping rather than scattering
+   explicit calls).
+2. **Phase 6 polish** items #2 (icon polish), #3 (Storybook for
+   `HunkDiff isSubHunk:true`), #4 (stage-state migration), #6
+   (right-click "Split before this line"), #7 (right-click
+   "Commit this line"), #8 (doc updates). All UI / UX polish;
+   none gate further user-visible functionality.
+3. **Open partial-commit duplication issue** — pure backend
+   trace-driven debugging in `to_additive_hunks` /
+   `safe_checkout`. Higher leverage than further polish: it's a
+   correctness bug in pure-add multi-section partial commits.
+4. **CLI parity** (Phase 6 #5) — punted indefinitely; needs
+   either disk-only access to the override store or
+   desktop↔CLI IPC.

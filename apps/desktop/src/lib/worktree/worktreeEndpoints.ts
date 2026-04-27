@@ -19,6 +19,12 @@ import type {
 
 export type RowRange = { start: number; end: number };
 
+/** Phase 7e: per-anchor summary returned by `list_commit_override_anchors`. */
+export type CommitOverrideSummary = {
+	anchor: HunkHeader;
+	ranges: RowRange[];
+};
+
 export function buildWorktreeEndpoints(build: BackendEndpointBuilder) {
 	return {
 		// ── Worktree Changes ────────────────────────────────────────
@@ -118,6 +124,46 @@ export function buildWorktreeEndpoints(build: BackendEndpointBuilder) {
 			extraOptions: { command: "unsplit_hunk" },
 			query: (args) => args,
 			invalidatesTags: [invalidatesList(ReduxTag.WorktreeChanges)],
+		}),
+
+		// ── Phase 7c-5: commit-anchored sub-hunk splits ─────────────
+		getDiffInCommit: build.query<
+			UnifiedDiff | null,
+			{ projectId: string; commitId: string; change: TreeChange }
+		>({
+			extraOptions: { command: "tree_change_diffs_in_commit" },
+			query: (args) => args,
+			providesTags: [providesList(ReduxTag.Diff)],
+		}),
+		listCommitOverrideAnchors: build.query<
+			CommitOverrideSummary[],
+			{ projectId: string; commitId: string; path: number[] }
+		>({
+			extraOptions: { command: "list_commit_override_anchors" },
+			query: (args) => args,
+			providesTags: [providesList(ReduxTag.Diff)],
+		}),
+		splitHunkInCommit: build.mutation<
+			void,
+			{
+				projectId: string;
+				commitId: string;
+				path: number[];
+				anchor: HunkHeader;
+				ranges: RowRange[];
+			}
+		>({
+			extraOptions: { command: "split_hunk_in_commit" },
+			query: (args) => args,
+			invalidatesTags: [invalidatesList(ReduxTag.Diff)],
+		}),
+		unsplitHunkInCommit: build.mutation<
+			void,
+			{ projectId: string; commitId: string; path: number[]; anchor: HunkHeader }
+		>({
+			extraOptions: { command: "unsplit_hunk_in_commit" },
+			query: (args) => args,
+			invalidatesTags: [invalidatesList(ReduxTag.Diff)],
 		}),
 
 		// ── File Search ─────────────────────────────────────────────
