@@ -431,10 +431,12 @@ worktree path uses, scoped to a specific source commit.
 ### Phasing
 
 - **7a:** generalize `SubHunkOverride` keying, keep worktree behavior
-  unchanged. **✅ Shipped this session.**
+  unchanged. **✅ Shipped.**
 - **7b:** wire commit diffs through `reconcile_with_overrides`-style
   pass so committed hunks render with the split icon when an override
-  exists.
+  exists. **✅ Backend foundation shipped this session** (commit-side
+  query helpers + worktree-reconcile isolation; RPC + frontend wiring
+  follows in 7c).
 - **7c:** add `split_hunk` variant for `(commit_id, path, anchor)`,
   validate per-range constraints exactly as the worktree path does.
 - **7d:** wrap `move_changes_between_commits` and `uncommit_changes`
@@ -1372,3 +1374,102 @@ gnarly rebase / cross-stack move work.
 3. The open partial-commit duplication bug (still unresolved) is
    independent of phase 7 keying and worth interleaving whenever
    the trace-driven diagnosis is convenient.
+
+## What landed in the phase 7b session (backend foundation)
+
+### Phase 7b — Commit-anchored override query helpers + reconcile isolation (shipped)
+
+**Why this exists.** Phase 7a widened the in-memory store key to
+`(SubHunkOriginLocation, HunkHeader)`, but the surrounding read paths
+(`list_overrides`) and the worktree reconcile (`reconcile_with_overrides`)
+still treated every entry uniformly. As soon as Phase 7c starts
+emitting `Commit { id, path }`-keyed overrides, the worktree reconcile
+would have called `apply_overrides_to_assignments` on them — finding no
+matching `path`/`anchor` in the worktree-derived `assignments` and
+either dropping or migrating them against worktree shape. That's
+silent corruption: the user splits a commit's hunk in 7c, then the
+next worktree refresh would erase the split state.
+
+7b closes that latent bug and provides the public API surface 7c will
+consume.
+
+**What landed.** All in `crates/but-hunk-assignment/src/sub_hunk.rs`:
+
+- New origin-aware list helpers:
+  - `list_worktree_overrides(gitdir) -> Vec<SubHunkOverride>`
+  - `list_commit_overrides(gitdir, commit_id) -> Vec<SubHunkOverride>`
+  - Internal `list_overrides_filtered(gitdir, predicate)`. The
+    pre-existing `list_overrides` is preserved as the unfiltered
+    diagnostic variant.
+- New write helper `upsert_override_at(gitdir, location, ov)` that
+  takes an explicit `SubHunkOriginLocation`. The pre-existing
+  `upsert_override` keeps its signature and routes through this with
+  `SubHunkOriginLocation::worktree(...)`. A `debug_assert_eq!`
+  enforces that `location.path() == ov.path` so a future caller
+  can't desynchronize them.
+- New read helper `get_commit_override(gitdir, commit_id, path,
+  anchor) -> Option<SubHunkOverride>` that builds a `Commit`-shaped
+  key. Returns `None` for any input today because nothing constructs
+  `Commit`-keyed overrides yet (that's 7c).
+- `reconcile_with_overrides` now reads `list_worktree_overrides` so
+  commit-anchored overrides are excluded from worktree-shape
+  reconciliation. Inline comment documents the contract.
+- `reconcile_with_overrides_persistent`'s memory-side join also
+  filters to worktree-only via `list_worktree_overrides`. The
+  disk-side join stays restricted to whatever the
+  `sub_hunk_overrides` table contains, which is worktree-only until
+  the 7c schema bump (`commit_id BLOB` column, `schema_version=2`).
+
+**What's *not* in 7b** (deferred to 7c):
+
+- `SubHunkOverride` does *not* yet carry an explicit `origin` field.
+  Adding it touches ~10 construction sites and ~40 read sites; 7c
+  introduces it alongside the first real `Commit` constructor. Until
+  then, the keying is final but the value's "self-knowledge" of
+  where it's anchored is implicit in the store key.
+- No new RPC. The desktop's per-commit hunk fetch path
+  (`tree_change_diffs`) is unchanged. 7c adds the commit-scoped
+  variant that runs the override pass.
+- DB schema unchanged. v2 (`commit_id BLOB` nullable) is part of 7c.
+
+**Tests** (3 new, total 83 in `but-hunk-assignment`):
+
+- `commit_anchored_overrides_are_isolated_from_worktree_lookups` —
+  insert one Worktree-keyed and one Commit-keyed override on the
+  same `(path, anchor)`; confirm they coexist; `get_override` /
+  `get_commit_override` / `list_worktree_overrides` /
+  `list_commit_overrides` all filter correctly; the unfiltered
+  `list_overrides` still sees both.
+- `worktree_reconcile_does_not_drop_commit_anchored_overrides` —
+  insert a Commit-keyed override; run `reconcile_with_overrides`
+  against an empty assignments list (the case that *would* have
+  silently corrupted state pre-7b); confirm the commit-keyed
+  override is still present, and a second reconcile remains a no-op
+  for the commit side.
+- `upsert_override_at_debug_asserts_path_consistency` — happy-path
+  cover for the new `upsert_override_at` constructor with matching
+  location/`ov` paths.
+
+### Recommended next-session pickup
+
+1. **Phase 7c** — the bulk of phase 7's backend:
+   - Add `pub origin: SubHunkOriginLocation` to `SubHunkOverride`,
+     update the ~10 construction sites, retire the
+     `key_for_override` "deferred refactor" comment.
+   - Add the `commit_id BLOB` column + `schema_version=2` migration
+     to `sub_hunk_overrides`. `to_db_row` / `from_db_row` widen to
+     read/write it; `MAX_OVERRIDE_DB_BYTES` size guard unchanged.
+   - Add `split_hunk_in_commit(commit_id, path, anchor, ranges)`
+     RPC mirroring `split_hunk` but routing through
+     `upsert_override_at`. Tauri allowlist + napi entry.
+   - Add `tree_change_diffs_in_commit(commit_id, change)` RPC that
+     runs an override pass on the unified patch (commit-side analog
+     of `reconcile_with_overrides`).
+   - Frontend: thread `commitId` through the diff view's RPC choice
+     so commit-diff views call the new variant. Reuse
+     `splitDiffHunkByHeaders` unchanged.
+2. **Phase 7d** — `move_sub_hunk` / `uncommit_sub_hunk` RPCs that
+   wrap `move_changes_between_commits` / `uncommit_changes` for
+   sub-ranges, encoding via the existing `encode_sub_hunk_for_commit`.
+3. The open partial-commit duplication bug remains independent of
+   phase 7 keying and worth interleaving whenever convenient.

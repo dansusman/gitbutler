@@ -1128,29 +1128,91 @@ fn key_for_override(ov: &SubHunkOverride) -> StoreKey {
     (SubHunkOriginLocation::worktree(ov.path.clone()), ov.anchor)
 }
 
-/// List the current overrides for the project at `gitdir`.
+/// List **all** overrides for the project at `gitdir`, regardless of
+/// origin. Mostly useful for diagnostics; reconcile passes should use
+/// the origin-filtered variants below to avoid mixing worktree- and
+/// commit-anchored overrides.
 pub fn list_overrides(gitdir: &Path) -> Vec<SubHunkOverride> {
+    list_overrides_filtered(gitdir, |_| true)
+}
+
+/// List only **worktree-anchored** overrides for `gitdir`.
+///
+/// This is what [`reconcile_with_overrides`] uses; commit-anchored
+/// overrides (Phase 7c) must not be subjected to a worktree-shape
+/// reconcile because they reference hunks inside a specific commit's
+/// diff and would be incorrectly migrated or dropped against the
+/// live worktree.
+pub fn list_worktree_overrides(gitdir: &Path) -> Vec<SubHunkOverride> {
+    list_overrides_filtered(gitdir, |loc| loc.is_worktree())
+}
+
+/// List only **commit-anchored** overrides for `gitdir` whose
+/// `SubHunkOriginLocation::Commit { id, .. }` matches `commit_id`.
+///
+/// Phase 7c uses this to apply per-commit override rendering when the
+/// desktop fetches a commit's diff. Until then, returns an empty
+/// list because no public API constructs `Commit`-keyed overrides.
+pub fn list_commit_overrides(gitdir: &Path, commit_id: gix::ObjectId) -> Vec<SubHunkOverride> {
+    list_overrides_filtered(gitdir, |loc| loc.commit_id() == Some(commit_id))
+}
+
+fn list_overrides_filtered<F>(gitdir: &Path, mut keep: F) -> Vec<SubHunkOverride>
+where
+    F: FnMut(&SubHunkOriginLocation) -> bool,
+{
     let store = global_store().lock().expect("override store poisoned");
     store
         .get(gitdir)
-        .map(|p| p.values().cloned().collect())
+        .map(|p| {
+            p.iter()
+                .filter(|((loc, _anchor), _)| keep(loc))
+                .map(|(_, ov)| ov.clone())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
-/// Insert or replace an override.
+/// Insert or replace an override (worktree-anchored). Equivalent to
+/// [`upsert_override_at`] with a `Worktree`-shaped location.
 pub fn upsert_override(gitdir: &Path, ov: SubHunkOverride) {
-    let mut store = global_store().lock().expect("override store poisoned");
-    let project = store.entry(gitdir.to_path_buf()).or_default();
-    let key = key_for_override(&ov);
-    project.insert(key, ov);
+    upsert_override_at(
+        gitdir,
+        SubHunkOriginLocation::worktree(ov.path.clone()),
+        ov,
+    );
 }
 
-/// Look up a single override by `(gitdir, path, anchor)`. Returns a clone
-/// so callers can read without holding the store lock.
+/// Insert or replace an override at an explicit
+/// [`SubHunkOriginLocation`]. The `location.path()` is expected to
+/// equal `ov.path` (the field is retained for backward compatibility;
+/// see also `key_for_override`'s deferred-refactor doc-comment).
 ///
-/// Worktree-anchored only; Phase 7c will introduce a `_at` variant that
-/// takes an explicit [`SubHunkOriginLocation`] for the commit-anchored
-/// case.
+/// Phase 7c uses this to insert `Commit`-keyed overrides via the
+/// commit-side `split_hunk` RPC. Phase 7b only constructs
+/// `Worktree`-keyed overrides through this entry point (via
+/// [`upsert_override`]).
+pub fn upsert_override_at(
+    gitdir: &Path,
+    location: SubHunkOriginLocation,
+    ov: SubHunkOverride,
+) {
+    debug_assert_eq!(
+        location.path(),
+        &ov.path,
+        "SubHunkOriginLocation.path must agree with SubHunkOverride.path"
+    );
+    let anchor = ov.anchor;
+    let mut store = global_store().lock().expect("override store poisoned");
+    let project = store.entry(gitdir.to_path_buf()).or_default();
+    project.insert((location, anchor), ov);
+}
+
+/// Look up a single worktree-anchored override by
+/// `(gitdir, path, anchor)`. Returns a clone so callers can read
+/// without holding the store lock.
+///
+/// For commit-anchored lookups, see [`get_commit_override`].
 pub fn get_override(
     gitdir: &Path,
     path: &BString,
@@ -1158,6 +1220,27 @@ pub fn get_override(
 ) -> Option<SubHunkOverride> {
     let store = global_store().lock().expect("override store poisoned");
     store.get(gitdir)?.get(&worktree_key(path, anchor)).cloned()
+}
+
+/// Look up a single commit-anchored override by
+/// `(gitdir, commit_id, path, anchor)`. Returns a clone so callers
+/// can read without holding the store lock.
+///
+/// Returns `None` for any input today because Phase 7b doesn't yet
+/// construct `Commit`-keyed overrides; Phase 7c populates them via
+/// the commit-side `split_hunk` RPC.
+pub fn get_commit_override(
+    gitdir: &Path,
+    commit_id: gix::ObjectId,
+    path: &BString,
+    anchor: HunkHeader,
+) -> Option<SubHunkOverride> {
+    let store = global_store().lock().expect("override store poisoned");
+    let key = (
+        SubHunkOriginLocation::commit(commit_id, path.clone()),
+        anchor,
+    );
+    store.get(gitdir)?.get(&key).cloned()
 }
 
 /// Insert one or more user-selected ranges into an existing override's
@@ -1300,7 +1383,12 @@ pub(crate) fn clear_store_for_tests_at(gitdir: Option<&Path>) {
 /// translating natural worktree hunks into `HunkAssignment`s and before
 /// reconciling against persisted SQLite state.
 pub fn reconcile_with_overrides(gitdir: &Path, assignments: &mut Vec<HunkAssignment>) {
-    let overrides = list_overrides(gitdir);
+    // Phase 7b: only worktree-anchored overrides are subject to the
+    // worktree-shape reconcile. Commit-anchored overrides (Phase 7c)
+    // reference hunks inside a specific commit's diff and would be
+    // incorrectly migrated or dropped against `assignments` (which
+    // are exclusively worktree-derived).
+    let overrides = list_worktree_overrides(gitdir);
     if overrides.is_empty() {
         return;
     }
@@ -1610,7 +1698,13 @@ pub fn reconcile_with_overrides_persistent(
         })
         .collect();
 
-    let mem_overrides = list_overrides(gitdir);
+    // Phase 7b: persistence is worktree-only today (the
+    // `sub_hunk_overrides` table has no `commit_id` column). The
+    // disk vs memory join therefore restricts the memory side to
+    // worktree-anchored overrides, mirroring what's actually
+    // persistable. Phase 7c widens the schema and this filter
+    // together.
+    let mem_overrides = list_worktree_overrides(gitdir);
     let mem_keyed: HashMap<(BString, HunkHeader), &SubHunkOverride> = mem_overrides
         .iter()
         .map(|ov| ((ov.path.clone(), ov.anchor), ov))
@@ -3201,6 +3295,154 @@ mod tests {
         assert_eq!(removed.anchor, ov.anchor);
         assert!(get_override(&gitdir, &path, anchor_h).is_none());
 
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 7b — commit-anchored override query helpers + worktree
+    // reconcile isolation.
+    //
+    // 7b adds `upsert_override_at`, `list_commit_overrides`, and
+    // `get_commit_override`, plus filters the worktree reconcile
+    // pass so commit-anchored overrides aren't subjected to
+    // worktree-shape migration / drop. These tests pin both shapes.
+    // ---------------------------------------------------------------
+
+    fn fixed_commit(hex_byte: u8) -> gix::ObjectId {
+        let s = std::iter::repeat_n(hex_byte, 40).collect::<Vec<_>>();
+        gix::ObjectId::from_hex(&s).unwrap()
+    }
+
+    #[test]
+    fn commit_anchored_overrides_are_isolated_from_worktree_lookups() {
+        let gitdir = std::path::PathBuf::from(format!(
+            "/tmp/gitbutler-test-7b-isol-{}",
+            uuid::Uuid::new_v4()
+        ));
+        clear_store_for_tests_at(Some(&gitdir));
+
+        // `make_stored_override` hardcodes path "foo.rs"; reuse it
+        // so the location.path() / ov.path agreement holds.
+        let path = BString::from("foo.rs");
+        let anchor_h = anchor();
+        let commit = fixed_commit(b'a');
+
+        // Insert a worktree-anchored and a commit-anchored override
+        // on the *same* (path, anchor). Both should coexist.
+        let wt_ov = make_stored_override(
+            anchor_h,
+            sample_diff(),
+            vec![RowRange { start: 2, end: 4 }],
+            BTreeMap::new(),
+        );
+        let cm_ov = make_stored_override(
+            anchor_h,
+            sample_diff(),
+            vec![RowRange { start: 1, end: 3 }],
+            BTreeMap::new(),
+        );
+
+        upsert_override(&gitdir, wt_ov.clone());
+        upsert_override_at(
+            &gitdir,
+            SubHunkOriginLocation::commit(commit, path.clone()),
+            cm_ov.clone(),
+        );
+
+        // Worktree lookup returns the worktree-keyed override only.
+        let got_wt = get_override(&gitdir, &path, anchor_h).unwrap();
+        assert_eq!(got_wt.ranges, wt_ov.ranges);
+
+        // Commit lookup returns the commit-keyed override only.
+        let got_cm = get_commit_override(&gitdir, commit, &path, anchor_h).unwrap();
+        assert_eq!(got_cm.ranges, cm_ov.ranges);
+
+        // list_*_overrides filters by origin.
+        assert_eq!(list_worktree_overrides(&gitdir).len(), 1);
+        assert_eq!(list_commit_overrides(&gitdir, commit).len(), 1);
+
+        // A different commit_id sees no commit-keyed overrides.
+        assert!(list_commit_overrides(&gitdir, fixed_commit(b'b')).is_empty());
+        assert!(get_commit_override(&gitdir, fixed_commit(b'b'), &path, anchor_h).is_none());
+
+        // The unfiltered `list_overrides` still returns both for
+        // diagnostics' sake.
+        assert_eq!(list_overrides(&gitdir).len(), 2);
+
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn worktree_reconcile_does_not_drop_commit_anchored_overrides() {
+        // The latent bug 7b fixes: pre-7b, `reconcile_with_overrides`
+        // would call `list_overrides`, which returned commit-keyed
+        // overrides too. Those would then be matched against
+        // `assignments` (worktree-derived), fail to find a match,
+        // and either be dropped or migrated against worktree
+        // shape — silently corrupting commit-side state.
+        let gitdir = std::path::PathBuf::from(format!(
+            "/tmp/gitbutler-test-7b-reconcile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        clear_store_for_tests_at(Some(&gitdir));
+
+        let path = BString::from("foo.rs");
+        let commit = fixed_commit(b'c');
+        let cm_ov = make_stored_override(
+            anchor(),
+            sample_diff(),
+            vec![RowRange { start: 2, end: 4 }],
+            BTreeMap::new(),
+        );
+        upsert_override_at(
+            &gitdir,
+            SubHunkOriginLocation::commit(commit, path.clone()),
+            cm_ov.clone(),
+        );
+
+        // Run a worktree reconcile against an empty assignments list.
+        // The commit-anchored override must survive untouched.
+        let mut assignments: Vec<HunkAssignment> = Vec::new();
+        reconcile_with_overrides(&gitdir, &mut assignments);
+
+        let still_there = get_commit_override(&gitdir, commit, &path, anchor())
+            .expect("commit-anchored override must survive worktree reconcile");
+        assert_eq!(still_there.ranges, cm_ov.ranges);
+
+        // And a second reconcile remains a no-op for the commit-side.
+        reconcile_with_overrides(&gitdir, &mut assignments);
+        assert!(get_commit_override(&gitdir, commit, &path, anchor()).is_some());
+
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn upsert_override_at_debug_asserts_path_consistency() {
+        // The path inside the location must match `ov.path`. We
+        // can only assert the agreement path actually works; the
+        // mismatch case fires `debug_assert_eq!` which we don't
+        // want to provoke from tests.
+        let gitdir = std::path::PathBuf::from(format!(
+            "/tmp/gitbutler-test-7b-pathok-{}",
+            uuid::Uuid::new_v4()
+        ));
+        clear_store_for_tests_at(Some(&gitdir));
+
+        let path = BString::from("foo.rs");
+        let commit = fixed_commit(b'd');
+        let ov = make_stored_override(
+            anchor(),
+            sample_diff(),
+            vec![RowRange { start: 2, end: 4 }],
+            BTreeMap::new(),
+        );
+
+        upsert_override_at(
+            &gitdir,
+            SubHunkOriginLocation::commit(commit, path.clone()),
+            ov,
+        );
+        assert!(get_commit_override(&gitdir, commit, &path, anchor()).is_some());
         clear_store_for_tests_at(Some(&gitdir));
     }
 }
