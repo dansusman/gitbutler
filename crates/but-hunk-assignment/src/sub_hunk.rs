@@ -1340,16 +1340,34 @@ pub fn merge_user_ranges_into_partition(
 
 /// Remove an override by `(path, anchor)`. Returns the removed override, if any.
 ///
-/// Worktree-anchored only; commit-anchored overrides require a
-/// `SubHunkOriginLocation`-shaped variant introduced in Phase 7c.
+/// Worktree-anchored only. For commit-anchored removal, see
+/// [`remove_override_at`].
 pub fn remove_override(
     gitdir: &Path,
     path: &BString,
     anchor: HunkHeader,
 ) -> Option<SubHunkOverride> {
+    remove_override_at(
+        gitdir,
+        &SubHunkOriginLocation::worktree(path.clone()),
+        anchor,
+    )
+}
+
+/// Remove an override at an explicit [`SubHunkOriginLocation`].
+/// Returns the removed override, if any.
+///
+/// Phase 7c-3 uses this for the commit-side `unsplit_hunk_in_commit`
+/// RPC; existing callers reach the in-memory store through
+/// [`remove_override`].
+pub fn remove_override_at(
+    gitdir: &Path,
+    location: &SubHunkOriginLocation,
+    anchor: HunkHeader,
+) -> Option<SubHunkOverride> {
     let mut store = global_store().lock().expect("override store poisoned");
     let project = store.get_mut(gitdir)?;
-    project.remove(&worktree_key(path, anchor))
+    project.remove(&(location.clone(), anchor))
 }
 
 /// Drop overrides whose `(path, anchor)` are listed in `keys`.
@@ -1675,25 +1693,43 @@ pub fn upsert_override_persistent(
 }
 
 /// Remove `(path, anchor)` both in memory and on disk
-/// (worktree-anchored). Commit-anchored removals reach the disk
-/// through Phase 7c-3's `unsplit_hunk_in_commit` RPC.
+/// (worktree-anchored). For commit-anchored removal, see
+/// [`remove_override_persistent_at`].
 pub fn remove_override_persistent(
     db: &mut but_db::DbHandle,
     gitdir: &Path,
     path: &BString,
     anchor: HunkHeader,
 ) -> Result<Option<SubHunkOverride>> {
+    remove_override_persistent_at(
+        db,
+        gitdir,
+        &SubHunkOriginLocation::worktree(path.clone()),
+        anchor,
+    )
+}
+
+/// Remove an override at an explicit [`SubHunkOriginLocation`] both
+/// in memory and on disk. Phase 7c-3's commit-side `unsplit_hunk`
+/// RPC enters here with a `Commit { id, path }` location.
+pub fn remove_override_persistent_at(
+    db: &mut but_db::DbHandle,
+    gitdir: &Path,
+    location: &SubHunkOriginLocation,
+    anchor: HunkHeader,
+) -> Result<Option<SubHunkOverride>> {
     ensure_hydrated(db, gitdir);
-    let removed = remove_override(gitdir, path, anchor);
+    let removed = remove_override_at(gitdir, location, anchor);
     let key = gitdir_key(gitdir);
+    let commit_id_bytes = origin_commit_id_bytes(location);
     db.sub_hunk_overrides_mut().delete(
         &key,
-        path,
+        location.path(),
         anchor.old_start,
         anchor.old_lines,
         anchor.new_start,
         anchor.new_lines,
-        &[],
+        &commit_id_bytes,
     )?;
     Ok(removed)
 }
@@ -3655,6 +3691,74 @@ mod tests {
         assert_eq!(restored.anchor, anchor());
 
         clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn remove_override_persistent_at_clears_commit_keyed_row() {
+        // Phase 7c-3: write a Commit-keyed override through the
+        // persistent path and confirm `remove_override_persistent_at`
+        // clears it from both layers.
+        let gitdir = fresh_gitdir("7c3-remove-at");
+        clear_store_for_tests_at(Some(&gitdir));
+        let mut db = fresh_db();
+
+        let commit = fixed_commit(b'7');
+        let path = BString::from("foo.rs");
+        let mut ov = make_stored_override(
+            anchor(),
+            sample_diff(),
+            vec![RowRange { start: 2, end: 4 }],
+            BTreeMap::new(),
+        );
+        ov.origin = SubHunkOriginLocation::commit(commit, path.clone());
+
+        upsert_override_persistent(&mut db, &gitdir, ov.clone()).unwrap();
+        // Both layers see it.
+        assert!(get_commit_override(&gitdir, commit, &path, anchor()).is_some());
+        let key = gitdir_key(&gitdir);
+        assert!(
+            db.sub_hunk_overrides()
+                .get(
+                    &key,
+                    &path,
+                    anchor().old_start,
+                    anchor().old_lines,
+                    anchor().new_start,
+                    anchor().new_lines,
+                    commit.as_bytes(),
+                )
+                .unwrap()
+                .is_some()
+        );
+
+        // Worktree-side `remove_override_persistent` must NOT touch
+        // the commit-keyed row.
+        remove_override_persistent(&mut db, &gitdir, &path, anchor()).unwrap();
+        assert!(
+            get_commit_override(&gitdir, commit, &path, anchor()).is_some(),
+            "worktree remove must leave commit-keyed override alone"
+        );
+
+        // Commit-side remove clears both layers.
+        let location = SubHunkOriginLocation::commit(commit, path.clone());
+        remove_override_persistent_at(&mut db, &gitdir, &location, anchor()).unwrap();
+        assert!(get_commit_override(&gitdir, commit, &path, anchor()).is_none());
+        assert!(
+            db.sub_hunk_overrides()
+                .get(
+                    &key,
+                    &path,
+                    anchor().old_start,
+                    anchor().old_lines,
+                    anchor().new_start,
+                    anchor().new_lines,
+                    commit.as_bytes(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        clear_store_for_tests_at(Some(&gitdir));
+        clear_hydrated_for_tests(&gitdir);
     }
 
     #[test]

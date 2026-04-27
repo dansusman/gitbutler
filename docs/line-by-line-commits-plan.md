@@ -444,8 +444,11 @@ worktree path uses, scoped to a specific source commit.
 - **7c-2:** `but-db` `sub_hunk_overrides` schema v2 — add
   `commit_id BLOB NOT NULL DEFAULT X''` column to the primary key,
   bump `OVERRIDE_DB_SCHEMA_VERSION` to 2, widen `to_db_row` /
-  `from_db_row` to encode/decode the column. **✅ Shipped this
-  session.**
+  `from_db_row` to encode/decode the column. **✅ Shipped.**
+- **7c-3:** `split_hunk_in_commit` and `unsplit_hunk_in_commit` RPCs
+  in `but-api/src/diff.rs`; new `remove_override_at` /
+  `remove_override_persistent_at` helpers; Tauri allowlist + main.rs
+  invoke list. **✅ Shipped this session.**
 - **7c:** add `split_hunk` variant for `(commit_id, path, anchor)`,
   validate per-range constraints exactly as the worktree path does.
 - **7d:** wrap `move_changes_between_commits` and `uncommit_changes`
@@ -1706,3 +1709,106 @@ still independent).
 4. Phase 7d / 7f remain untouched (move + uncommit of sub-hunks,
    override migration on commit rewrite). 7c-3..5 are the path
    to user-visible commit-side splits.
+
+## What landed in the phase 7c-3 session
+
+### Phase 7c-3 — Commit-side `split_hunk` / `unsplit_hunk` RPCs
+
+**Why this exists.** Phases 7a/7b/7c-1/7c-2 made the in-memory store
+and on-disk schema commit-aware, but no public API was yet capable of
+*creating* a `Commit { id, path }`-keyed override. 7c-3 adds the two
+RPCs that let a commit-diff view register a sub-hunk split.
+
+**Changes in `crates/but-hunk-assignment`** (`sub_hunk.rs`):
+
+- New `pub fn remove_override_at(gitdir, location, anchor)` — generic
+  in-memory remove keyed by `SubHunkOriginLocation`. Worktree variant
+  `remove_override` now delegates to it.
+- New `pub fn remove_override_persistent_at(db, gitdir, location, anchor)`
+  — disk write-through analog. Encodes the location's commit id via
+  `origin_commit_id_bytes` for the `delete` row predicate.
+- `lib.rs` re-exports the two new helpers.
+
+**Changes in `crates/but-api`** (`src/diff.rs`):
+
+- `split_hunk_in_commit(ctx, commit_id, path, anchor, ranges)` plus
+  `_with_perm` variant. Mirrors `split_hunk` but resolves the anchor
+  against `CommitDetails::from_commit_id(commit_id, line_stats=No)`
+  's `diff_with_first_parent` (the commit's diff against its first
+  parent) instead of the worktree. Re-split semantics work the same
+  way: an existing commit-keyed override on `(commit, path, anchor)`
+  has its `ranges` partition refined via
+  `merge_user_ranges_into_partition`. The override is persisted via
+  the existing `upsert_override_persistent` (which already encodes
+  origin into `commit_id` on the row through `to_db_row`).
+- `unsplit_hunk_in_commit(ctx, commit_id, path, anchor)` plus
+  `_with_perm` variant. Routes through
+  `remove_override_persistent_at` with a `Commit { id, path }`
+  location.
+- Both RPCs `#[but_api(napi)]`-decorated and `#[instrument]`-traced
+  to mirror the worktree variants' shape.
+- Both RPCs use `RepoExclusive` permission scope (DB write-through
+  + future commit-tree work in 7d).
+
+**Changes in `crates/gitbutler-tauri`**:
+
+- `permissions/default.toml`: added `"split_hunk_in_commit"` and
+  `"unsplit_hunk_in_commit"` to the allowlist (sibling of
+  `"split_hunk"`).
+- `main.rs`: registered
+  `diff::tauri_split_hunk_in_commit::split_hunk_in_commit` and
+  `diff::tauri_unsplit_hunk_in_commit::unsplit_hunk_in_commit` in
+  the `tauri::generate_handler!` invoke list.
+
+**Tests** (1 new, total 89 in `but-hunk-assignment`):
+
+- `remove_override_persistent_at_clears_commit_keyed_row` —
+  end-to-end coverage of the new write/read symmetry: write a
+  Commit-keyed override via `upsert_override_persistent`, confirm
+  both in-memory and disk see it; verify the worktree-side
+  `remove_override_persistent` does *not* touch the commit-keyed
+  row (the origin isolation introduced by 7b is preserved across
+  the persistent helpers); finally clear via the new `_at` helper
+  and confirm both layers are empty.
+
+**Test totals after this session**: `but-hunk-assignment` 89,
+`but-db` 134 (carried from 7c-2), all green; workspace builds clean.
+
+### What's intentionally *not* shipped this session (deferred to 7c-4 / 7c-5)
+
+- **No commit-diff override-aware diff RPC.** The desktop's
+  `tree_change_diffs(change)` doesn't know which commit the change
+  came from, so even after `split_hunk_in_commit` lands an override
+  on disk, the commit-diff UI still renders the natural hunk. 7c-4
+  adds `tree_change_diffs_in_commit(commit_id, change)` that runs a
+  commit-side override-materialization pass on the patch's hunks
+  before returning.
+- **No frontend wiring.** 7c-5 threads `commitId` through the
+  diff-view RPC choice; reuses `splitDiffHunkByHeaders` unchanged.
+
+### Recommended next-session pickup
+
+1. **Phase 7c-4** — `tree_change_diffs_in_commit` RPC. The
+   override-materialization pass for commit diffs reuses
+   `materialize_override` semantics from `sub_hunk.rs`, but emits
+   results into a `UnifiedPatch` rather than `HunkAssignment` rows.
+   Probably easiest to add a parallel
+   `materialize_override_into_patch(patch, override) -> UnifiedPatch`
+   helper rather than retro-fitting the worktree path.
+2. **Phase 7c-5** — frontend: in `apps/desktop/src/lib/worktree/
+   worktreeEndpoints.ts` (or a new `commitEndpoints.ts`), add
+   a `getCommitDiff` query that calls the new RPC, plus
+   `splitHunkInCommit` / `unsplitHunkInCommit` mutations. The
+   `UnifiedDiffView` for commit views switches to the new endpoints
+   when `commitId` is non-null. Reuse `splitDiffHunkByHeaders`.
+3. **Phase 7d** — `move_sub_hunk` / `uncommit_sub_hunk`: now that
+   commit-side overrides can be created and persisted, the next
+   workflow is "drag a commit's sub-hunk to another commit / back
+   to the worktree". Wraps `move_changes_between_commits` /
+   `uncommit_changes` for sub-ranges via
+   `encode_sub_hunk_for_commit`.
+4. **Phase 7f** — override migration on commit rewrite. When a
+   source commit gets rewritten by 7d's move flow, the commit-keyed
+   override on the source needs to migrate to the rewritten commit
+   id (via the same content-match logic Phase 4.5 used for the
+   worktree case).

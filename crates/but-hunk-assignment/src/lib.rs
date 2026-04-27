@@ -20,9 +20,9 @@ pub use sub_hunk::{
     from_db_row, get_commit_override, get_override, hydrate_from_db,
     list_commit_overrides, list_overrides, list_worktree_overrides,
     merge_user_ranges_into_partition, reconcile_with_overrides,
-    reconcile_with_overrides_persistent, remove_override,
-    remove_override_persistent, to_db_row, upsert_override, upsert_override_at,
-    upsert_override_persistent,
+    reconcile_with_overrides_persistent, remove_override, remove_override_at,
+    remove_override_persistent, remove_override_persistent_at, to_db_row,
+    upsert_override, upsert_override_at, upsert_override_persistent,
 };
 
 use std::collections::{BTreeMap, HashMap};

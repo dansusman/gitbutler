@@ -425,7 +425,9 @@ fn main() -> anyhow::Result<()> {
                 diff::tauri_tree_change_diffs::tree_change_diffs,
                 diff::tauri_assign_hunk::assign_hunk,
                 diff::tauri_split_hunk::split_hunk,
+                diff::tauri_split_hunk_in_commit::split_hunk_in_commit,
                 diff::tauri_unsplit_hunk::unsplit_hunk,
+                diff::tauri_unsplit_hunk_in_commit::unsplit_hunk_in_commit,
                 #[cfg(unix)]
                 legacy::workspace::tauri_show_graph_svg::show_graph_svg,
                 legacy::claude::tauri_claude_get_session_details::claude_get_session_details,

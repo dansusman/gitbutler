@@ -446,3 +446,180 @@ pub fn unsplit_hunk_with_perm(
     Ok(())
 }
 
+/// Phase 7c-3: split a hunk inside an existing commit's diff against
+/// its first parent into one or more sub-hunks.
+///
+/// Mirrors [`split_hunk`] but the override is anchored to a specific
+/// `commit_id` rather than the live worktree. Until Phase 7c-4 wires
+/// the commit-side override-aware diff RPC, the resulting sub-hunks
+/// are persisted to disk but not yet visible in the commit-diff UI.
+///
+/// Validation rules (mirrors the worktree variant):
+/// - the anchor must match a hunk in the commit's first-parent diff
+///   for `path`,
+/// - at least one non-empty range,
+/// - ranges sorted, disjoint, and contained within the anchor's row
+///   count,
+/// - ranges do not collectively cover every row in the anchor.
+#[but_api(napi)]
+#[instrument(skip_all, err(Debug))]
+pub fn split_hunk_in_commit(
+    ctx: &mut Context,
+    commit_id: gix::ObjectId,
+    path: BString,
+    anchor: HunkHeader,
+    ranges: Vec<RowRange>,
+) -> anyhow::Result<()> {
+    let mut guard = ctx.exclusive_worktree_access();
+    split_hunk_in_commit_with_perm(
+        ctx,
+        commit_id,
+        path,
+        anchor,
+        ranges,
+        guard.write_permission(),
+    )
+}
+
+/// Implementation of [`split_hunk_in_commit`] under caller-held
+/// exclusive repository access.
+pub fn split_hunk_in_commit_with_perm(
+    ctx: &mut Context,
+    commit_id: gix::ObjectId,
+    path: BString,
+    anchor: HunkHeader,
+    ranges: Vec<RowRange>,
+    perm: &mut RepoExclusive,
+) -> anyhow::Result<()> {
+    let context_lines = ctx.settings.context_lines;
+    let gitdir = ctx.gitdir.clone();
+    let (repo, _ws, mut db) = ctx.workspace_mut_and_db_mut_with_perm(perm)?;
+
+    // Fetch the commit's diff against its first parent. Same shape
+    // `commit_details` already exposes to the desktop, but we don't
+    // need line stats for an override write.
+    let attached = commit_id.attach(&repo);
+    let details = CommitDetails::from_commit_id(attached, /* line_stats = */ false)?;
+
+    let change = details
+        .diff_with_first_parent
+        .iter()
+        .find(|c| c.path == path)
+        .ok_or_else(|| {
+            anyhow!(
+                "path {} not present in commit {}'s diff",
+                path,
+                commit_id
+            )
+        })?;
+    let patch = change
+        .unified_patch(&repo, context_lines)?
+        .ok_or_else(|| anyhow!("path {} has no unified patch", path))?;
+    let hunks = match patch {
+        but_core::UnifiedPatch::Patch { hunks, .. } => hunks,
+        _ => bail!("path {} is not a textual patch in commit {}", path, commit_id),
+    };
+    let hunk = hunks
+        .iter()
+        .find(|h| HunkHeader::from(*h) == anchor)
+        .ok_or_else(|| {
+            anyhow!("anchor hunk not found in commit {}'s diff", commit_id)
+        })?;
+    let kinds = but_hunk_assignment::sub_hunk::parse_row_kinds(hunk.diff.as_ref());
+    let row_count = kinds.len() as u32;
+
+    let trimmed: Vec<RowRange> = ranges
+        .into_iter()
+        .filter_map(|r| but_hunk_assignment::sub_hunk::trim_context(r, &kinds))
+        .collect();
+    but_hunk_assignment::sub_hunk::validate_ranges(&trimmed, row_count)
+        .with_context(|| "invalid split request")?;
+
+    let mut anchor_diff = BString::default();
+    anchor_diff.extend_from_slice(
+        format!(
+            "@@ -{},{} +{},{} @@\n",
+            anchor.old_start, anchor.old_lines, anchor.new_start, anchor.new_lines
+        )
+        .as_bytes(),
+    );
+    anchor_diff.extend_from_slice(hunk.diff.as_ref());
+
+    // Re-split support: merge new ranges into an existing
+    // commit-keyed override's partition rather than replacing it.
+    let location =
+        but_hunk_assignment::SubHunkOriginLocation::commit(commit_id, path.clone());
+    let existing =
+        but_hunk_assignment::get_commit_override(&gitdir, commit_id, &path, anchor);
+    let merged_assignments = existing
+        .as_ref()
+        .map(|ov| ov.assignments.clone())
+        .unwrap_or_default();
+    let stored_ranges = match existing.as_ref() {
+        Some(ov) => but_hunk_assignment::merge_user_ranges_into_partition(
+            &ov.ranges, &trimmed,
+        ),
+        None => but_hunk_assignment::sub_hunk::materialize_residual_ranges(
+            &trimmed, &kinds,
+        ),
+    };
+
+    // `upsert_override_persistent` already encodes the location into
+    // `commit_id` on the row via `to_db_row`, so a single call
+    // persists the commit-keyed override correctly.
+    but_hunk_assignment::upsert_override_persistent(
+        &mut db,
+        &gitdir,
+        SubHunkOverride {
+            origin: location,
+            path,
+            anchor,
+            ranges: stored_ranges,
+            assignments: merged_assignments,
+            rows: kinds,
+            anchor_diff,
+        },
+    )?;
+    Ok(())
+}
+
+/// Phase 7c-3: reverse a previous [`split_hunk_in_commit`] for
+/// `(commit_id, path, anchor)`. Materialized sub-hunks reabsorb into
+/// the natural anchor on the next commit-diff render pass.
+#[but_api(napi)]
+#[instrument(skip_all, err(Debug))]
+pub fn unsplit_hunk_in_commit(
+    ctx: &mut Context,
+    commit_id: gix::ObjectId,
+    path: BString,
+    anchor: HunkHeader,
+) -> anyhow::Result<()> {
+    let mut guard = ctx.exclusive_worktree_access();
+    unsplit_hunk_in_commit_with_perm(
+        ctx,
+        commit_id,
+        path,
+        anchor,
+        guard.write_permission(),
+    )
+}
+
+/// Implementation of [`unsplit_hunk_in_commit`] under caller-held
+/// exclusive repository access.
+pub fn unsplit_hunk_in_commit_with_perm(
+    ctx: &mut Context,
+    commit_id: gix::ObjectId,
+    path: BString,
+    anchor: HunkHeader,
+    perm: &mut RepoExclusive,
+) -> anyhow::Result<()> {
+    let gitdir = ctx.gitdir.clone();
+    let (_repo, _ws, mut db) = ctx.workspace_mut_and_db_mut_with_perm(perm)?;
+    let location =
+        but_hunk_assignment::SubHunkOriginLocation::commit(commit_id, path);
+    let _removed = but_hunk_assignment::remove_override_persistent_at(
+        &mut db, &gitdir, &location, anchor,
+    )?;
+    Ok(())
+}
+
