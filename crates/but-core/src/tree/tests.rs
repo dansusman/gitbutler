@@ -373,7 +373,7 @@ mod to_additive_hunks {
         insta::assert_debug_snapshot!(actual, @r#"
         (
             [
-                HunkHeader("-3,0", "+3,1"),
+                HunkHeader("-1,0", "+3,1"),
             ],
             [],
         )

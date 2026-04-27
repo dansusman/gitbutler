@@ -372,6 +372,45 @@ mod test {
             );
         }
 
+        /// The field-observed shape user reported in the worktree-side
+        /// amend flow: HEAD already contains Section B; worktree has
+        /// the full A/B/C file; user drags 2 alpha lines from Section
+        /// A to amend the existing Section B commit. The desktop emits
+        /// `(-0,0 +7,2)` for those two rows (worktree positions 7-8).
+        /// Expected: alpha lines land at the top of the resulting
+        /// commit's tree (above the existing Section B), not appended
+        /// at the end.
+        ///
+        /// Pre-fix `to_additive_hunks` over-counted preceding-context
+        /// rows because the unselected pure-adds (Section A header,
+        /// top-of-file lines) all sat in the same wh as the alpha
+        /// lines. The clamp to `wh.old_lines` keeps the offset honest.
+        #[test]
+        fn commit_alpha_lines_when_only_section_b_is_in_head() {
+            let old = b"\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n";
+            let new = b"# split test\n\nthis whole file is uncommitted\npure-add hunk\n\n## Section A\n- alpha line one\n- alpha line two\n- alpha line three\n\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n## Section C\n- gamma line one\n- gamma line two\n- gamma line three\n";
+            // Worktree-vs-HEAD: 6 old rows shared; 13 new rows added.
+            // 0-context wh splits into a top region (10 added rows, no
+            // shared rows around them) and a bottom region (3 added
+            // rows after the shared block).
+            let wh_with_context = vec![h(1, 6, 1, 19)];
+            let wh_no_context = vec![h(1, 0, 1, 10), h(7, 0, 17, 3)];
+            // User drags rows 7-8 (alpha line one, alpha line two).
+            let (hunks, rejected) = to_additive_hunks_for_test(
+                vec![h(0, 0, 7, 2)],
+                &wh_with_context,
+                &wh_no_context,
+            )
+            .unwrap();
+            assert_eq!(rejected, &[] as &[HunkHeader]);
+            let result = apply_hunks(old.as_bstr(), new.as_bstr(), &hunks).unwrap();
+            assert_eq!(
+                result.as_bstr(),
+                b"- alpha line one\n- alpha line two\n\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n".as_bstr(),
+                "alpha lines must land above HEAD's existing Section B, not appended after it",
+            );
+        }
+
         /// The field-observed shape: pre-commit baseline has
         /// `\n## Section B\n- beta one\n` (3 rows, the leading blank +
         /// the B header + the first beta), worktree adds Section A on

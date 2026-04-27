@@ -407,8 +407,20 @@ fn to_additive_hunks(
                 // this remove plus any pure-add rows already inserted
                 // earlier in this wh (those have consumed positions in
                 // the new-side row space).
+                //
+                // The clamp to `wh.new_lines` is load-bearing: when the
+                // user is committing only a subset of a wh's pure-removes
+                // (e.g. dragging one sub-hunk out of a multi-section
+                // worktree hunk), the un-committed pure-removes
+                // contribute to `preceding_old` but not to
+                // `pure_remove_rows_in_wh`, so the raw
+                // `preceding_context` over-counts. Clamping to
+                // `wh.new_lines` keeps the offset within the wh's
+                // actual context-row budget.
                 let preceding_old = sh.old_start.saturating_sub(wh.old_start);
-                let preceding_context = preceding_old.saturating_sub(pure_remove_rows_in_wh);
+                let preceding_context = preceding_old
+                    .saturating_sub(pure_remove_rows_in_wh)
+                    .min(wh.new_lines.saturating_sub(pure_add_rows_in_wh));
                 let new_start = wh.new_start + preceding_context + pure_add_rows_in_wh;
                 hunks_to_commit.push(HunkHeader {
                     old_start: sh.old_start,
@@ -435,8 +447,17 @@ fn to_additive_hunks(
                 // old row. Anchor the emitted old_start past the context
                 // rows that precede this add plus any pure-remove rows
                 // already consumed earlier in this wh.
+                //
+                // The clamp to `wh.old_lines` matters for partial-commit
+                // shapes where the worktree hunk has many disjoint
+                // pure-add regions and the user is only committing one:
+                // un-committed preceding pure-add rows would otherwise be
+                // mis-counted as context. Clamping to the wh's
+                // remaining-context budget keeps the offset honest.
                 let preceding_new = sh.new_start.saturating_sub(wh.new_start);
-                let preceding_context = preceding_new.saturating_sub(pure_add_rows_in_wh);
+                let preceding_context = preceding_new
+                    .saturating_sub(pure_add_rows_in_wh)
+                    .min(wh.old_lines.saturating_sub(pure_remove_rows_in_wh));
                 let old_start = wh.old_start + preceding_context + pure_remove_rows_in_wh;
                 hunks_to_commit.push(HunkHeader {
                     old_start,
