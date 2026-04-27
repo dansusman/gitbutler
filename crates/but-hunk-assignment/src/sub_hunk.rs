@@ -101,6 +101,71 @@ pub enum RowKind {
     Remove,
 }
 
+/// Where a sub-hunk override is anchored.
+///
+/// Phase 7 generalizes the override store key from `(path, anchor)` to
+/// `(origin, anchor)` so that overrides on hunks inside an existing
+/// **commit** can coexist with overrides on hunks in the **worktree**.
+/// The keying axis is final as of 7a; only the [`Self::Worktree`]
+/// variant is constructed today — 7c is the phase that actually emits
+/// [`Self::Commit`]-keyed overrides via a new `split_hunk` variant
+/// scoped to a `(commit_id, path, anchor)` triple.
+///
+/// On-disk persistence (Phase 6.5b) currently holds Worktree-keyed
+/// overrides only. The `sub_hunk_overrides` schema gains a nullable
+/// `commit_id` column in 7c (treated as v2 of the schema; null ≡
+/// Worktree).
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase", tag = "type", content = "subject")]
+pub enum SubHunkOriginLocation {
+    /// Override anchored to a hunk in the live worktree diff for `path`.
+    Worktree { path: BString },
+    /// Override anchored to a hunk in the diff of `id` against its
+    /// parent, for `path`.
+    Commit {
+        #[serde(with = "but_serde::object_id")]
+        id: gix::ObjectId,
+        path: BString,
+    },
+}
+
+impl SubHunkOriginLocation {
+    /// Construct a worktree-anchored override key for `path`.
+    pub fn worktree(path: BString) -> Self {
+        Self::Worktree { path }
+    }
+
+    /// Construct a commit-anchored override key for `path` inside the
+    /// commit `id`.
+    pub fn commit(id: gix::ObjectId, path: BString) -> Self {
+        Self::Commit { id, path }
+    }
+
+    /// The path the override is anchored on. Always present regardless
+    /// of variant.
+    pub fn path(&self) -> &BString {
+        match self {
+            Self::Worktree { path } | Self::Commit { path, .. } => path,
+        }
+    }
+
+    /// The commit id the override is anchored to, or `None` for the
+    /// worktree case.
+    pub fn commit_id(&self) -> Option<gix::ObjectId> {
+        match self {
+            Self::Worktree { .. } => None,
+            Self::Commit { id, .. } => Some(*id),
+        }
+    }
+
+    /// True iff this is a worktree-anchored override.
+    pub fn is_worktree(&self) -> bool {
+        matches!(self, Self::Worktree { .. })
+    }
+}
+
 /// In-memory provenance attached to a sub-hunk `HunkAssignment` so that the
 /// commit pipeline can re-encode the sub-range using the engine-native
 /// null-side encoding (see [`encode_sub_hunk_for_commit`]).
@@ -1034,12 +1099,33 @@ fn remap_range(
 // Process-wide in-memory store
 // ---------------------------------------------------------------------------
 
-type ProjectStore = HashMap<(BString, HunkHeader), SubHunkOverride>;
+/// Process-wide store key. Phase 7a widened this from
+/// `(BString, HunkHeader)` to `(SubHunkOriginLocation, HunkHeader)` so
+/// commit-anchored overrides (Phase 7c) can coexist with worktree-
+/// anchored ones. Today only the `Worktree` variant is ever
+/// constructed.
+type StoreKey = (SubHunkOriginLocation, HunkHeader);
+type ProjectStore = HashMap<StoreKey, SubHunkOverride>;
 
 static GLOBAL_STORE: OnceLock<Mutex<HashMap<PathBuf, ProjectStore>>> = OnceLock::new();
 
 fn global_store() -> &'static Mutex<HashMap<PathBuf, ProjectStore>> {
     GLOBAL_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Build the worktree-flavored store key for `(path, anchor)`. All
+/// existing `path`/`anchor`-shaped public APIs route through this
+/// helper so Phase 7a is a no-op on the worktree side.
+fn worktree_key(path: &BString, anchor: HunkHeader) -> StoreKey {
+    (SubHunkOriginLocation::worktree(path.clone()), anchor)
+}
+
+/// Build the store key implied by `ov`'s current shape. Today every
+/// `SubHunkOverride` is implicitly worktree-anchored; once the
+/// `SubHunkOverride` struct gains an explicit `origin` field (Phase
+/// 7b/c follow-up), this function will read it directly.
+fn key_for_override(ov: &SubHunkOverride) -> StoreKey {
+    (SubHunkOriginLocation::worktree(ov.path.clone()), ov.anchor)
 }
 
 /// List the current overrides for the project at `gitdir`.
@@ -1055,18 +1141,23 @@ pub fn list_overrides(gitdir: &Path) -> Vec<SubHunkOverride> {
 pub fn upsert_override(gitdir: &Path, ov: SubHunkOverride) {
     let mut store = global_store().lock().expect("override store poisoned");
     let project = store.entry(gitdir.to_path_buf()).or_default();
-    project.insert((ov.path.clone(), ov.anchor), ov);
+    let key = key_for_override(&ov);
+    project.insert(key, ov);
 }
 
 /// Look up a single override by `(gitdir, path, anchor)`. Returns a clone
 /// so callers can read without holding the store lock.
+///
+/// Worktree-anchored only; Phase 7c will introduce a `_at` variant that
+/// takes an explicit [`SubHunkOriginLocation`] for the commit-anchored
+/// case.
 pub fn get_override(
     gitdir: &Path,
     path: &BString,
     anchor: HunkHeader,
 ) -> Option<SubHunkOverride> {
     let store = global_store().lock().expect("override store poisoned");
-    store.get(gitdir)?.get(&(path.clone(), anchor)).cloned()
+    store.get(gitdir)?.get(&worktree_key(path, anchor)).cloned()
 }
 
 /// Insert one or more user-selected ranges into an existing override's
@@ -1124,6 +1215,9 @@ pub fn merge_user_ranges_into_partition(
 }
 
 /// Remove an override by `(path, anchor)`. Returns the removed override, if any.
+///
+/// Worktree-anchored only; commit-anchored overrides require a
+/// `SubHunkOriginLocation`-shaped variant introduced in Phase 7c.
 pub fn remove_override(
     gitdir: &Path,
     path: &BString,
@@ -1131,21 +1225,24 @@ pub fn remove_override(
 ) -> Option<SubHunkOverride> {
     let mut store = global_store().lock().expect("override store poisoned");
     let project = store.get_mut(gitdir)?;
-    project.remove(&(path.clone(), anchor))
+    project.remove(&worktree_key(path, anchor))
 }
 
 /// Drop overrides whose `(path, anchor)` are listed in `keys`.
 ///
 /// Used by [`reconcile_with_overrides`] to silently drop overrides whose
 /// anchor no longer matches a natural hunk in the worktree.
+///
+/// Worktree-anchored only — the `BString`-shaped key is implicitly
+/// `SubHunkOriginLocation::Worktree`.
 pub fn drop_overrides(gitdir: &Path, keys: &[(BString, HunkHeader)]) {
     if keys.is_empty() {
         return;
     }
     let mut store = global_store().lock().expect("override store poisoned");
     if let Some(project) = store.get_mut(gitdir) {
-        for key in keys {
-            project.remove(key);
+        for (path, anchor) in keys {
+            project.remove(&worktree_key(path, *anchor));
         }
     }
 }
@@ -1173,9 +1270,10 @@ pub fn migrate_stored_override_multi(
 ) {
     let mut store = global_store().lock().expect("override store poisoned");
     let Some(project) = store.get_mut(gitdir) else { return };
-    project.remove(&(path.clone(), old_anchor));
+    project.remove(&worktree_key(path, old_anchor));
     for m in migrated {
-        project.insert((m.path.clone(), m.anchor), m);
+        let key = key_for_override(&m);
+        project.insert(key, m);
     }
 }
 
@@ -1486,6 +1584,14 @@ pub fn reconcile_with_overrides_persistent(
     ensure_hydrated(db, gitdir);
     reconcile_with_overrides(gitdir, assignments);
 
+    // Phase 7a note: both `disk_keyed` and `mem_keyed` below are
+    // intentionally `(BString, HunkHeader)`-keyed rather than
+    // `StoreKey`-keyed. Persistence today is worktree-only (the
+    // `sub_hunk_overrides` table has no `commit_id` column), and
+    // the in-memory store only ever contains `Worktree`-shaped keys
+    // because nothing constructs `Commit`-shaped keys yet. Phase 7c
+    // adds the `commit_id` column + a v2 schema bump and widens both
+    // sides here.
     let key = gitdir_key(gitdir);
     let disk_rows = db.sub_hunk_overrides().list_for_gitdir(&key)?;
     let disk_keyed: HashMap<(BString, HunkHeader), but_db::SubHunkOverrideRow> = disk_rows
@@ -2999,6 +3105,102 @@ mod tests {
         let in_mem = list_overrides(&gitdir);
         assert_eq!(in_mem.len(), 1);
         assert_eq!(in_mem[0].anchor, ov.anchor);
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 7a — SubHunkOriginLocation enum smoke tests.
+    //
+    // The widened store key is purely structural in 7a (nothing
+    // constructs `Commit` variants yet), so the meaningful coverage
+    // is the enum's own contract: equality, hashing, accessors,
+    // serde round-trip. Phase 7c adds end-to-end coverage that two
+    // overrides on the same `(path, anchor)` but different
+    // `commit_id`s coexist in the store.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn origin_location_worktree_and_commit_have_distinct_keys() {
+        use std::collections::HashSet;
+        let path = BString::from("src/foo.rs");
+        let commit = gix::ObjectId::from_hex(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+
+        let wt = SubHunkOriginLocation::worktree(path.clone());
+        let cm = SubHunkOriginLocation::commit(commit, path.clone());
+
+        assert_ne!(wt, cm);
+        assert_eq!(wt.path(), &path);
+        assert_eq!(cm.path(), &path);
+        assert!(wt.is_worktree());
+        assert!(!cm.is_worktree());
+        assert_eq!(wt.commit_id(), None);
+        assert_eq!(cm.commit_id(), Some(commit));
+
+        // HashMap key disambiguation: same path, same anchor, but
+        // different origin must produce two distinct keys.
+        let anchor = HunkHeader {
+            old_start: 1,
+            old_lines: 2,
+            new_start: 1,
+            new_lines: 3,
+        };
+        let mut keys: HashSet<StoreKey> = HashSet::new();
+        keys.insert((wt, anchor));
+        keys.insert((cm, anchor));
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn origin_location_serde_round_trip() {
+        let path = BString::from("src/foo.rs");
+        let commit = gix::ObjectId::from_hex(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
+
+        for original in [
+            SubHunkOriginLocation::worktree(path.clone()),
+            SubHunkOriginLocation::commit(commit, path.clone()),
+        ] {
+            let json = serde_json::to_string(&original).unwrap();
+            let restored: SubHunkOriginLocation = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, original);
+            assert_eq!(restored.path(), original.path());
+            assert_eq!(restored.commit_id(), original.commit_id());
+        }
+    }
+
+    #[test]
+    fn worktree_keyed_overrides_round_trip_through_store() {
+        // Pre-existing call sites use `(path, anchor)`-shaped public
+        // APIs which 7a routes through the worktree variant of the
+        // new enum key. This pins that the routing is in fact a
+        // no-op on observable behavior.
+        let gitdir = std::path::PathBuf::from(format!(
+            "/tmp/gitbutler-test-7a-{}",
+            uuid::Uuid::new_v4()
+        ));
+        clear_store_for_tests_at(Some(&gitdir));
+
+        let ov = make_stored_override(
+            anchor(),
+            sample_diff(),
+            vec![RowRange { start: 2, end: 4 }],
+            BTreeMap::new(),
+        );
+        let path = ov.path.clone();
+        let anchor_h = ov.anchor;
+
+        upsert_override(&gitdir, ov.clone());
+        let got = get_override(&gitdir, &path, anchor_h)
+            .expect("override should be retrievable via worktree key");
+        assert_eq!(got.path, ov.path);
+        assert_eq!(got.anchor, ov.anchor);
+
+        let removed = remove_override(&gitdir, &path, anchor_h)
+            .expect("override should be removable via worktree key");
+        assert_eq!(removed.anchor, ov.anchor);
+        assert!(get_override(&gitdir, &path, anchor_h).is_none());
+
         clear_store_for_tests_at(Some(&gitdir));
     }
 }

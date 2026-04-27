@@ -22,14 +22,14 @@ Last updated: end of "phase 5 polish + sub-hunk re-split + 6.5a" session.
 | 5a/b/c — Gesture rewrite + popover (Stage / Comment / Split / Cancel) | **Shipped (this session)** | _pending_ |
 | 5d — Single-tap opens popover + sub-hunk re-split (merge into existing override) | **Shipped (this session)** | _pending_ |
 | 5e — Polish: blank-`+` row absorption in Split gesture; sub-hunk discard re-encoding | **Shipped (this session)** | _pending_ |
-| 6 — Polish (hunk-dep on sub-hunks, storybook, etc.) | Not started | — |
+| 6 — Polish (hunk-dep on sub-hunks, storybook, etc.) | **In progress** (item #1 shipped this session) | _pending_ |
 | 6.5a — Serde-fy `SubHunkOverride` (in-memory round-trip) | **Shipped** | _pending_ |
 | 6.5b — `but-db` `sub_hunk_overrides` schema + CRUD | **Shipped** | _pending_ |
 | 6.5c — Hydration on-demand (`ensure_hydrated`) + bridge (`to_db_row` / `from_db_row`) | **Shipped (this session)** | _pending_ |
 | 6.5d — Write-through on `split_hunk` / `unsplit_hunk` + read-path hydration in `changes_in_worktree_with_perm` | **Shipped (this session)** | _pending_ |
 | 6.5e — Size guard (`MAX_OVERRIDE_DB_BYTES = 64 KB`) | **Shipped (this session)** | _pending_ |
 | 6.5d-followup — Wire `reconcile_with_overrides_persistent` into `assignments_with_fallback` / `assign` (write-through on partial-commit migration / drops) | **Shipped (this session)** | _pending_ |
-| **7 — Splitting committed work + cross-stack moves of split pieces** | **Not started — critical for downstream workflow** | — |
+| **7 — Splitting committed work + cross-stack moves of split pieces** | **In progress** (7a shipped this session) | _pending_ |
 | **⚠ Open: partial-commit content duplication on pure-add sub-hunks** | **Investigating** | — |
 
 ## What's validated end-to-end (manual GUI smoke test against `~/buttest`)
@@ -431,7 +431,7 @@ worktree path uses, scoped to a specific source commit.
 ### Phasing
 
 - **7a:** generalize `SubHunkOverride` keying, keep worktree behavior
-  unchanged.
+  unchanged. **✅ Shipped this session.**
 - **7b:** wire commit diffs through `reconcile_with_overrides`-style
   pass so committed hunks render with the split icon when an override
   exists.
@@ -1210,3 +1210,165 @@ migrated post-partial-commit override on `splittest_pure_add.md`
 and the migrated post-edit override on `athirdfile.md` are now
 durably persisted on the same tick as the in-memory mutation.
 ✅
+
+## What landed in the phase 6 polish (item #1) session
+
+### Phase 6 polish #1 — Hunk-dependency analysis on sub-hunks
+
+**Premise.** The override pass in `but-hunk-assignment` materializes
+sub-hunks as ordinary `HunkAssignment` rows whose synthesized
+`HunkHeader` carries narrower `(new_start, new_lines)` than the
+parent natural hunk. The hunk-dependency engine
+(`but-hunk-dependency::ranges::PathRanges::intersects`) is structurally
+agnostic to that width — it consumes plain `(start, lines)` pairs.
+Sub-hunks should therefore lock exactly the slice of committed range
+they overlap, with no special-casing.
+
+**What was missing.** Nothing in the production code path. But the
+contract was implicit: a future refactor that re-widened a sub-hunk
+to its parent anchor before intersection (a plausible "fix" to a
+caller that mistakenly thinks sub-hunks are a different shape) would
+break lock attribution silently, with no test guarding the boundary.
+
+**What landed.** Two new pinning unit tests in
+`crates/but-hunk-dependency/src/ranges/tests/path.rs`:
+
+- `sub_hunk_narrower_range_locks_only_overlapping_slice` — committed
+  modification at line 4 of a 7-line file. The natural parent hunk
+  spanning lines 1..=7 locks; the three sub-hunks the user might
+  carve out (lines 1..=3, 4..=4, 5..=7) lock only the middle one.
+- `sub_hunk_one_row_lock_at_committed_addition_boundary` —
+  committed pure-addition spanning new-side lines 4..=8. 1-row
+  sub-hunks at every line inside the window lock; 1-row sub-hunks
+  at lines 3 and 9 (immediately outside) don't.
+
+The tests are deliberately at the `PathRanges` layer (rather than
+end-to-end through `assignments_with_fallback` +
+`hunk_dependencies_for_workspace_changes_by_worktree_dir`) because
+the layering is already correct and the coupling to be guarded is
+purely numeric: any sub-hunk synthesized by the override pass turns
+into a `(new_start, new_lines)` query at this layer, so pinning the
+intersection contract here covers every downstream consumer.
+
+**Tests:** 33 unit + 20 integration in `but-hunk-dependency` all
+green; no other crate touched.
+
+### What's still left in Phase 6
+
+2. **Visual polish on the split icon** — design review, not a code task.
+3. **Storybook story for `HunkDiff` with `isSubHunk: true`** — UI-only.
+4. **Stage state migration across split / unsplit (Option B)** — punt
+   until users hit the dropped-stage case in practice.
+5. **CLI parity** — punt; needs cross-process IPC or DB-only access
+   path to the override store.
+6. **Right-click "Split hunk before this line"** in
+   `HunkContextMenu.svelte` — single-click 2-way split for keyboard
+   accessibility.
+7. **Right-click "Commit this line"** — composite shortcut; needs
+   stack-target picker design.
+8. **Doc updates** per the corrections list at the top of this file.
+
+### Recommended next-session pickup
+
+1. **Phase 5d** — Playwright happy-path covering drag→popover→Split
+   →drag-to-stack→unsplit. Smoke-tested manually; spec is
+   straightforward.
+2. **Open partial-commit duplication issue** (see `⚠ Open` section
+   above) — needs trace logging in `to_additive_hunks` and/or
+   `safe_checkout`'s 3-way merge to confirm whether sub-hunk
+   encoding emits overlapping null-side ranges. Higher priority
+   than further phase-6 polish: this is a correctness bug, not a
+   UX-polish gap.
+3. **Phase 7** — committed-hunk splits + cross-stack moves of split
+   pieces. Inherits the `sub_hunk_overrides` schema from 6.5 via a
+   `schema_version=2` migration that widens the primary key to
+   `(gitdir, commit_id, path, anchor_*)`.
+
+## What landed in the phase 7a session
+
+### Phase 7a — Generalize `SubHunkOverride` keying (shipped)
+
+**Why:** Phase 7 widens the override store key from `(path, anchor)`
+to a sum type that distinguishes worktree-anchored overrides from
+overrides anchored to a hunk inside a specific commit's diff against
+its parent. Landing the type ahead of any commit-side functionality
+means 7b/7c are purely additive — no key-shape churn during the
+gnarly rebase / cross-stack move work.
+
+**What landed:**
+
+- New `pub enum SubHunkOriginLocation` in
+  `crates/but-hunk-assignment/src/sub_hunk.rs`:
+  - `Worktree { path: BString }` — implied by every public API today.
+  - `Commit { id: gix::ObjectId, path: BString }` — defined but not
+    yet constructed; 7c adds the `split_hunk` variant that emits it.
+  - Derives `Hash + Eq + Ord + Clone + Serialize + Deserialize` plus
+    accessors `path()`, `commit_id()`, `is_worktree()` and constructors
+    `worktree(path)` / `commit(id, path)`.
+- Process-wide store key widened from `(BString, HunkHeader)` to
+  `(SubHunkOriginLocation, HunkHeader)` via a new
+  `type StoreKey = (SubHunkOriginLocation, HunkHeader)`. Two
+  internal helpers thread the worktree variant through every
+  existing key construction site:
+  - `worktree_key(path, anchor)` for callers that already have
+    `(path, anchor)`.
+  - `key_for_override(ov)` for callers that have a `SubHunkOverride`
+    in hand. This is the integration point that 7b/c will widen
+    once `SubHunkOverride` itself gains an explicit `origin` field.
+- All existing public functions kept their signatures so caller code
+  in `but-api/src/diff.rs` (and the desktop frontend invocation
+  shape) is unchanged:
+  - `upsert_override`, `get_override`, `remove_override`
+  - `drop_overrides`, `migrate_stored_override`,
+    `migrate_stored_override_multi`
+  - the `_persistent` variants and `reconcile_with_overrides{,_persistent}`
+- `reconcile_with_overrides_persistent` carries a Phase 7a comment
+  documenting that its `(BString, HunkHeader)`-keyed `disk_keyed` /
+  `mem_keyed` joins are intentionally narrow today: the
+  `sub_hunk_overrides` table has no `commit_id` column (added in
+  7c via a `schema_version=2` migration), and nothing constructs
+  `Commit`-shaped in-memory keys yet. 7c widens both sides here in
+  one motion.
+
+**Tests** (3 new, total 80 in `but-hunk-assignment`):
+
+- `origin_location_worktree_and_commit_have_distinct_keys` — Worktree
+  and Commit variants on the same `(path, anchor)` produce distinct
+  HashMap entries.
+- `origin_location_serde_round_trip` — both variants round-trip
+  losslessly through `serde_json` (worktree path bytes preserved
+  via `BString`'s native serde; commit id via the
+  `but_serde::object_id` hex module).
+- `worktree_keyed_overrides_round_trip_through_store` — the
+  `(path, anchor)` public APIs (`upsert_override` / `get_override` /
+  `remove_override`) still work end-to-end through the new keying,
+  pinning that 7a is observably a no-op on the worktree path.
+
+### What's intentionally *not* shipped this session (deferred to 7b–g)
+
+- **`SubHunkOverride` does not yet carry `origin: SubHunkOriginLocation`.**
+  Adding the field touches ~30 construction sites in the test suite
+  plus the bridge code; deferring to 7b/c keeps 7a a tight diff and
+  lets the field be introduced alongside the first real use of the
+  `Commit` variant.
+- **No DB schema changes.** The `sub_hunk_overrides` table still
+  matches the v1 (Phase 6.5b) shape. A `schema_version=2` migration
+  adding nullable `commit_id BLOB` is part of 7c.
+- **No commit-diff rendering, no commit-side `split_hunk` RPC, no
+  cross-stack move of sub-hunks.** Those are 7b, 7c, 7d respectively.
+
+### Recommended next-session pickup
+
+1. **Phase 7b** — render committed hunks through a
+   `reconcile_with_overrides`-style pass on commit diffs. Requires
+   identifying the desktop's per-commit hunk fetch path (likely in
+   `crates/but-api/src/commit/...` or wherever the diff for a
+   selected commit is requested) and threading the override pass
+   through it. Until 7c lands the `Commit`-keyed `split_hunk`,
+   this is observably a no-op — but it gates 7c's frontend work.
+2. **Phase 7c** — `SubHunkOverride::origin` field + commit-keyed
+   `split_hunk` RPC + DB schema v2 migration adding `commit_id BLOB`.
+   This is the bulk of phase 7's backend.
+3. The open partial-commit duplication bug (still unresolved) is
+   independent of phase 7 keying and worth interleaving whenever
+   the trace-driven diagnosis is convenient.
