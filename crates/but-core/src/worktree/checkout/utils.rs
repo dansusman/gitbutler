@@ -12,11 +12,51 @@ use gix::{
 };
 
 use crate::{
-    RepositoryExt, TreeStatus,
+    TreeStatus,
     ext::ObjectStorageExt,
     snapshot,
     worktree::checkout::{Outcome, UncommitedWorktreeChanges},
 };
+
+/// Build a new destination tree by overlaying the worktree-side blob (from the
+/// snapshot's `worktree` subtree) on top of `destination_tree_id` for each
+/// path in `selection`.
+///
+/// This is the `KeepAndPreferTheirs` shortcut: rather than a 3-way text merge
+/// of (pre-commit HEAD, post-commit HEAD, worktree), we treat the worktree
+/// as authoritative for any path it touches, and leave the rest of the
+/// destination tree alone.
+fn overlay_worktree_paths_onto_destination(
+    repo: &gix::Repository,
+    snapshot_tree_id: gix::ObjectId,
+    destination_tree_id: gix::ObjectId,
+    selection: &BTreeSet<BString>,
+) -> anyhow::Result<gix::ObjectId> {
+    let snapshot_tree = snapshot_tree_id.attach(repo).object()?.try_into_tree()?;
+    let worktree_entry = snapshot_tree.lookup_entry_by_path("worktree")?;
+    let mut editor = repo
+        .find_tree(destination_tree_id)?
+        .edit()?;
+    if let Some(worktree_entry) = worktree_entry {
+        let worktree_subtree = worktree_entry.object()?.try_into_tree()?;
+        for path in selection {
+            let rel = std::path::Path::new(
+                path.to_str().map_err(|e| anyhow::anyhow!("non-utf8 path in selection: {e}"))?,
+            );
+            match worktree_subtree.lookup_entry_by_path(rel)? {
+                Some(entry) => {
+                    editor.upsert(path.as_bstr(), entry.mode().kind(), entry.object_id())?;
+                }
+                None => {
+                    // Path was selected but the worktree snapshot has no blob for it;
+                    // this is a conflict-only / index-only situation. Fall back to
+                    // leaving the destination tree's entry untouched.
+                }
+            }
+        }
+    }
+    Ok(editor.write()?.detach())
+}
 
 pub fn merge_worktree_changes_into_destination_or_keep_snapshot(
     changed_files: &[(ChangeKind, BString)],
@@ -84,69 +124,78 @@ pub fn merge_worktree_changes_into_destination_or_keep_snapshot(
                 source_tree_id.attach(&repo_in_memory),
                 snapshot::create_tree::State {
                     changes,
-                    selection: selection_of_changes_checkout_would_affect,
+                    selection: selection_of_changes_checkout_would_affect.clone(),
                     head: false,
                 },
             )?;
 
             if !out.is_empty() {
-                // For `KeepAndPreferTheirs` (post-commit safe_checkout) tell the merge to
-                // resolve overlapping hunks in favour of theirs (worktree). This handles
-                // partial commits where the worktree retains additional changes that
-                // overlap with what was committed: ours and theirs are textually
-                // compatible (theirs is a superset of ours) but git's diff-based merge
-                // can't see that and would otherwise report a conflict.
-                let cherry_pick_options =
-                    if matches!(uncommitted_changes, UncommitedWorktreeChanges::KeepAndPreferTheirs) {
-                        let opts = repo_in_memory
-                            .tree_merge_options()?
-                            .with_file_favor(Some(gix::merge::tree::FileFavor::Theirs));
-                        Some(opts)
-                    } else {
-                        None
-                    };
-                let resolve = crate::snapshot::resolve_tree(
-                    out.snapshot_tree.attach(&repo_in_memory),
-                    destination_tree_id,
-                    snapshot::resolve_tree::Options {
-                        worktree_cherry_pick: cherry_pick_options,
-                    },
-                )?;
-                let new_destination_id =
-                    if let Some(mut worktree_cherry_pick) = resolve.worktree_cherry_pick {
-                        // re-apply snapshot of just what we need and see if they apply cleanly.
-                        match uncommitted_changes {
-                            UncommitedWorktreeChanges::KeepAndAbortOnConflict => {
-                                let unresolved = TreatAsUnresolved::git();
-                                if worktree_cherry_pick.has_unresolved_conflicts(unresolved) {
-                                    let mut paths = worktree_cherry_pick
-                                        .conflicts
-                                        .iter()
-                                        .filter(|c| c.is_unresolved(unresolved))
-                                        .map(|c| format!("{:?}", c.ours.location()))
-                                        .collect::<Vec<_>>();
-                                    paths.sort();
-                                    paths.dedup();
-                                    bail!(
-                                        "Worktree changes would be overwritten by checkout: {}",
-                                        paths.join(", ")
-                                    );
-                                }
-                            }
-                            UncommitedWorktreeChanges::KeepConflictingInSnapshotAndOverwrite => {}
-                            UncommitedWorktreeChanges::KeepAndPreferTheirs => {
-                                // FileFavor::Theirs has resolved any overlapping hunks; the
-                                // merged tree carries the worktree's content and is safe to use.
-                            }
-                        }
-                        let res = Some(worktree_cherry_pick.tree.write()?.detach());
+                let new_destination_id = match uncommitted_changes {
+                    UncommitedWorktreeChanges::KeepAndPreferTheirs => {
+                        // Bypass merge_trees entirely. The worktree is already the source
+                        // of truth on a partial-commit safe_checkout: the new HEAD only
+                        // records part of what's on disk, and we just need the destination
+                        // tree to reflect the worktree's content for the touched files.
+                        // gix's text-line merge previously double-applied non-conflicting
+                        // overlapping additions present in both ours (post-commit HEAD)
+                        // and theirs (worktree), duplicating just-committed sections in
+                        // the worktree. Overlay each selected file's worktree blob onto
+                        // the destination tree directly to avoid any merge work.
+                        let id = overlay_worktree_paths_onto_destination(
+                            &repo_in_memory,
+                            out.snapshot_tree,
+                            destination_tree_id,
+                            &selection_of_changes_checkout_would_affect,
+                        )?;
                         if let Some(memory) = repo_in_memory.objects.take_object_memory() {
                             memory.persist(repo_in_memory)?;
                         }
-                        res
-                    } else {
-                        None
-                    };
+                        Some(id)
+                    }
+                    UncommitedWorktreeChanges::KeepAndAbortOnConflict
+                    | UncommitedWorktreeChanges::KeepConflictingInSnapshotAndOverwrite => {
+                        let resolve = crate::snapshot::resolve_tree(
+                            out.snapshot_tree.attach(&repo_in_memory),
+                            destination_tree_id,
+                            snapshot::resolve_tree::Options {
+                                worktree_cherry_pick: None,
+                            },
+                        )?;
+                        if let Some(mut worktree_cherry_pick) = resolve.worktree_cherry_pick {
+                            // re-apply snapshot of just what we need and see if they apply cleanly.
+                            match uncommitted_changes {
+                                UncommitedWorktreeChanges::KeepAndAbortOnConflict => {
+                                    let unresolved = TreatAsUnresolved::git();
+                                    if worktree_cherry_pick.has_unresolved_conflicts(unresolved) {
+                                        let mut paths = worktree_cherry_pick
+                                            .conflicts
+                                            .iter()
+                                            .filter(|c| c.is_unresolved(unresolved))
+                                            .map(|c| format!("{:?}", c.ours.location()))
+                                            .collect::<Vec<_>>();
+                                        paths.sort();
+                                        paths.dedup();
+                                        bail!(
+                                            "Worktree changes would be overwritten by checkout: {}",
+                                            paths.join(", ")
+                                        );
+                                    }
+                                }
+                                UncommitedWorktreeChanges::KeepConflictingInSnapshotAndOverwrite => {}
+                                UncommitedWorktreeChanges::KeepAndPreferTheirs => {
+                                    unreachable!("handled in outer match arm")
+                                }
+                            }
+                            let res = Some(worktree_cherry_pick.tree.write()?.detach());
+                            if let Some(memory) = repo_in_memory.objects.take_object_memory() {
+                                memory.persist(repo_in_memory)?;
+                            }
+                            res
+                        } else {
+                            None
+                        }
+                    }
+                };
                 return Ok(Some((out.snapshot_tree, new_destination_id)));
                 // TODO: deal with index, but to do that it needs to be merged with destination tree!
             }

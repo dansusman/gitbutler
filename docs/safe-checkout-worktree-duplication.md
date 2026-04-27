@@ -1,8 +1,20 @@
 # `safe_checkout` worktree duplication on partial commits
 
-Status: **open**, post-Phase-7h. Tracks the "Hypothesis #2" leftover from
-the `⚠ Open issue` section in
+Status: **fixed** (Option A landed). Tracks the "Hypothesis #2" leftover
+from the `⚠ Open issue` section in
 [`docs/line-by-line-commits-plan.md`](./line-by-line-commits-plan.md).
+
+The `KeepAndPreferTheirs` arm of
+`crates/but-core/src/worktree/checkout/utils.rs::merge_worktree_changes_into_destination_or_keep_snapshot`
+now bypasses `merge_trees` and directly overlays the snapshot's
+worktree blobs onto the destination tree for each selected path. Pinned
+by the unit test
+`crates/but-core/tests/core/worktree/checkout.rs::worktree::checkout::keep_and_prefer_theirs_does_not_duplicate_overlapping_additions`,
+which reproduces the duplication shape (theirs has a Section X prefix
+that shifts theirs' Section A insert to a different line offset than
+ours') and asserts the worktree is byte-identical to theirs after
+safe_checkout. Pre-fix that test fails with Section A duplicated; post
+fix the worktree is unchanged.
 
 ## TL;DR
 

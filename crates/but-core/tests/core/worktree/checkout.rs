@@ -913,6 +913,76 @@ fn unrelated_additions_do_not_affect_worktree_changes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reproduces the post-Phase-7h `safe_checkout` worktree-duplication bug
+/// described in `docs/safe-checkout-worktree-duplication.md`.
+///
+/// Set-up:
+///   * `base` (HEAD) has `splittest.md` containing only Section B.
+///   * `theirs` (worktree on disk) is `base` plus Section A above Section B
+///     and Section C below — the user's full uncommitted file.
+///   * `ours` (the post-partial-commit tree the user just amended into) is
+///     `base` plus Section A above Section B (a subset of theirs).
+///
+/// `safe_checkout` with `KeepAndPreferTheirs` should leave the worktree
+/// **identical to theirs** — no Section A duplication. Pre-fix, gix's
+/// text-line merge double-applied the Section A block (present in both ours
+/// and theirs) and wrote a worktree blob with two copies of Section A.
+#[test]
+fn keep_and_prefer_theirs_does_not_duplicate_overlapping_additions() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario("unborn-empty");
+    let file_path = repo.workdir_path("splittest.md").expect("non-bare");
+
+    // base: Section B only.
+    let base_content = b"\n## Section B\n- beta one\n- beta two\n- beta three\n\n";
+    let base_blob = repo.write_blob(base_content.as_slice())?.detach();
+    let mut editor = repo.empty_tree().edit()?;
+    editor.upsert("splittest.md", EntryKind::Blob, base_blob)?;
+    let base_tree = editor.write()?.detach();
+    let base_commit = repo.new_commit("base: Section B only", base_tree, None::<gix::ObjectId>)?;
+    // Move HEAD onto the baseline commit so safe_checkout's HEAD-tree check
+    // matches `current_head_id`.
+    let head_ref_name = repo.head_name()?.expect("unborn HEAD points at refs/heads/main");
+    repo.reference(
+        head_ref_name.as_ref(),
+        base_commit.id,
+        gix::refs::transaction::PreviousValue::Any,
+        "baseline",
+    )?;
+
+    // ours (post-amend HEAD): Section A above Section B.
+    let ours_content = b"\n## Section A\n- alpha one\n- alpha two\n- alpha three\n\n## Section B\n- beta one\n- beta two\n- beta three\n\n";
+    let ours_blob = repo.write_blob(ours_content.as_slice())?.detach();
+    let mut editor = repo.empty_tree().edit()?;
+    editor.upsert("splittest.md", EntryKind::Blob, ours_blob)?;
+    let ours_tree = editor.write()?.detach();
+    let ours_commit = repo.new_commit("ours: Section A added above Section B", ours_tree, [base_commit.id])?;
+
+    // theirs (worktree): a Section X header (only on disk), then Section A
+    // above Section B (matching ours' addition), then Section C below. The
+    // Section X prefix shifts theirs' Section A insertion to a different
+    // line offset than ours' insertion, which is the shape that lets gix's
+    // text-line merge silently double-apply the Section A block.
+    let theirs_content = b"# header\nintro line one\nintro line two\n\n## Section A\n- alpha one\n- alpha two\n- alpha three\n\n## Section B\n- beta one\n- beta two\n- beta three\n\n## Section C\n- gamma one\n- gamma two\n- gamma three\n";
+    std::fs::write(&file_path, theirs_content)?;
+
+    let opts = checkout::Options {
+        uncommitted_changes: UncommitedWorktreeChanges::KeepAndPreferTheirs,
+        skip_head_update: false,
+    };
+    let _ = safe_checkout(base_commit.id, ours_commit.id, &repo, opts)?;
+
+    // The worktree must equal `theirs` byte-for-byte: no Section A
+    // duplication, no missing Section C.
+    let actual = std::fs::read(&file_path)?;
+    assert_eq!(
+        actual,
+        theirs_content.as_slice(),
+        "worktree must be unchanged after KeepAndPreferTheirs safe_checkout; got:\n{}",
+        String::from_utf8_lossy(&actual),
+    );
+    Ok(())
+}
+
 fn overwrite_options() -> checkout::Options {
     checkout::Options {
         uncommitted_changes: UncommitedWorktreeChanges::KeepConflictingInSnapshotAndOverwrite,

@@ -748,11 +748,22 @@ encoding path:
    header runs after a migration round (e.g. two `(-0,0 +N,K)`
    ranges whose `[N, N+K)` spans intersect). `to_additive_hunks`
    then applies both, double-inserting the overlapping rows.
-2. `safe_checkout`'s 3-way merge on partial commits (`base = pre-
+2. ~~`safe_checkout`'s 3-way merge on partial commits (`base = pre-
    commit HEAD`, `ours = post-commit HEAD`, `theirs = worktree`)
    over-merges when `theirs` is a strict superset of `ours`,
    leaving the committed rows still present in the worktree as if
-   they hadn't moved into HEAD.
+   they hadn't moved into HEAD.~~ **Confirmed and fixed.** See
+   `docs/safe-checkout-worktree-duplication.md` for the full
+   investigation. Pinned by
+   `crates/but-core/tests/core/worktree/checkout.rs::worktree::checkout::keep_and_prefer_theirs_does_not_duplicate_overlapping_additions`,
+   which reproduces the duplication on pre-fix code (gix's text-line
+   merge double-applies overlapping additions when ours and theirs
+   add the same content at compatible-but-different positions). The
+   `KeepAndPreferTheirs` arm in
+   `crates/but-core/src/worktree/checkout/utils.rs` now bypasses
+   `merge_trees` and directly overlays the snapshot's worktree blobs
+   onto the destination tree for selected paths (Option A from the
+   writeup).
 3. `From<HunkAssignment> for DiffSpec` emits the natural-anchor
    header *and* the encoded sub-range when both `hunk_header` and
    `sub_hunk_origin` are set. (Read of the impl in
@@ -2926,3 +2937,127 @@ behavior is closer to user intent).
    #4 (stage-state migration), #6/#7 (right-click options), #8
    (doc updates).
 4. **Phase 5d Playwright** for the worktree gesture happy-path.
+
+## What landed in the safe_checkout worktree-duplication fix session
+
+### Root cause: gix's text-line merge over-applies overlapping additions
+
+The `KeepAndPreferTheirs` arm of
+`crates/but-core/src/worktree/checkout/utils.rs::merge_worktree_changes_into_destination_or_keep_snapshot`
+built a 3-way merge with `base = pre-commit HEAD`, `ours = post-commit
+HEAD`, `theirs = worktree`, and asked gix to resolve conflicts in
+favour of theirs (`FileFavor::Theirs`). `FileFavor::Theirs` only flips
+the winner on conflicts gix *detects*; for non-conflicting overlapping
+additions — the partial-commit shape where `ours` adds a block at one
+offset and `theirs` adds the same block at a compatible-but-different
+offset — gix's text-line merger silently applies both adds, producing a
+worktree blob with the just-committed section duplicated.
+
+The field repro from `docs/safe-checkout-worktree-duplication.md`
+(Section B amended onto retest, then Section A amended onto fdfdfdf,
+worktree ends with two copies of Section A) was Hypothesis #2 from the
+original `⚠ Open issue` enumeration; Hypothesis #1 was already closed
+by the previous `to_additive_hunks` running-totals fix.
+
+### Fix
+
+Option A from the writeup: bypass `merge_trees` entirely on the
+`KeepAndPreferTheirs` arm. The intent of that variant is exactly "the
+worktree is already the source of truth on disk, just stamp the
+corresponding tree object into the destination," so a real 3-way merge
+is structurally unnecessary.
+
+New helper `overlay_worktree_paths_onto_destination` in
+`utils.rs` opens `destination_tree_id` as a `gix::object::tree::Editor`,
+looks up each selected path inside the snapshot's `worktree` subtree,
+and `upsert`s the worktree blob's `(EntryKind, ObjectId)` onto the
+destination editor. Paths missing from the worktree subtree (e.g.
+conflict-only / index-only entries) are left alone in the destination
+tree. Other selection arms (`KeepAndAbortOnConflict`,
+`KeepConflictingInSnapshotAndOverwrite`) still go through
+`resolve_tree` / `merge_trees`; only `KeepAndPreferTheirs` short-circuits.
+
+The outer match was restructured so the `cherry_pick_options` /
+`with_file_favor(Theirs)` plumbing is gone — the `KeepAndPreferTheirs`
+arm no longer touches gix's merge machinery at all.
+
+### Tests
+
+New unit test in
+`crates/but-core/tests/core/worktree/checkout.rs::worktree::checkout::keep_and_prefer_theirs_does_not_duplicate_overlapping_additions`
+constructs the bug shape directly through `safe_checkout`:
+
+- `base` = `splittest.md` containing only Section B.
+- `ours` (post-amend HEAD commit) = Section A above Section B.
+- `theirs` (worktree on disk) = `# header\nintro\u00d72\n## Section A\n...\n## Section B\n...\n## Section C\n...` — a Section X prefix shifts theirs' Section A insertion
+  to a different line offset than ours' insertion, which is the shape
+  that defeats gix's same-content dedup.
+
+Runs `safe_checkout(base_commit.id, ours_commit.id, &repo,
+KeepAndPreferTheirs)` and asserts the worktree file is byte-identical
+to `theirs_content`. Pre-fix the assertion fails with a duplicated
+Section A block; post-fix the worktree is unchanged.
+
+All 12 tests in `crates/but-core/tests/core/worktree/checkout.rs` and
+the 247-test `but-workspace` + `but-rebase` suites pass.
+
+### Live verification
+
+Dev app rebuilt (`pnpm dev:desktop`, `target/tauri/debug/gitbutler-tauri`
+PID 70619). Drove the field repro on `~/buttest`'s `iuhiuh` stack via
+7 sub-hunk amends:
+
+- `/tmp/gitbutler-dev.log` shows 7 `commit_amend` → `safe_checkout`
+  cycles with `conflicting_worktree_changes_opts=KeepAndPreferTheirs`.
+  All closed cleanly, ~3-4ms `safe_checkout`, ~36-41ms full amend.
+  Zero `ERROR` / `panic` / "would be overwritten" lines.
+- `~/buttest/splittest_pure_add.md` post-test: clean 19-row A/B/C
+  content with no Section A duplication.
+- Stack tip trees:
+  - `8b39965 retest`: Section B + Section C only.
+  - `beaf179 fdfdfdf`: Section A + Section B + Section C.
+  - HEAD blob → worktree diff: just the title + intro lines, the
+    intentionally-uncommitted prefix the user is still iterating on.
+- `but.sqlite::sub_hunk_overrides`: exactly 1 surviving row
+  (`schema_version=2`), anchor `(-1,3 +1,7)` matching the current
+  natural worktree hunk against HEAD, `commit_id` empty (uncommitted
+  anchor), `ranges_json=[[0,4)]`, `assignments_json=[]`,
+  `rows_json=[add\u00d74, context\u00d73]`. The override survived 7
+  amends with its anchor migrating cleanly through each
+  `commit_amend → safe_checkout → reconcile` cycle.
+
+The ⚠ open issue from `docs/safe-checkout-worktree-duplication.md` is
+now closed.
+
+### What's *not* in this session
+
+- **Workspace-level integration test** through
+  `but-rebase::graph_rebase::materialize`. The unit test pins the
+  `safe_checkout` contract directly; mirroring it through the full
+  amend pipeline would close the loop further but is heavier and
+  the unit test catches the bug shape sufficiently. Punt unless a
+  future regression suggests otherwise.
+- **Edit-mode worktree-sync paths.** Edit-mode bypasses the
+  `crate::commit::*` RPCs and writes its own checkouts. If those
+  start using `KeepAndPreferTheirs` (today they don't — phase 7i
+  punt), they'll inherit the new overlay shortcut for free.
+
+### Verification
+
+- `cargo test -p but-core` — 137 tests, all green (12 in
+  `worktree::checkout::*` including the new pinning test).
+- `cargo test -p but-rebase -p but-workspace` — 247 tests, all
+  green.
+- `cargo build --workspace` — clean.
+- Manual GUI verification per `docs/safe-checkout-worktree-duplication.md`
+  recipe: passed.
+
+### Recommended next-session pickup
+
+1. **Phase 7i / edit-mode override migration** if those surfaces
+   start carrying commit-keyed overrides in practice.
+2. **Phase 6 polish** — remaining items #2 (icon), #3 (Storybook),
+   #4 (stage-state migration), #6/#7 (right-click options), #8
+   (doc updates).
+3. **Phase 5d Playwright** for the worktree gesture happy-path.
+4. **CLI parity** — still punted.
