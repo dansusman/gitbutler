@@ -440,7 +440,12 @@ worktree path uses, scoped to a specific source commit.
 - **7c-1:** add `pub origin: SubHunkOriginLocation` to
   `SubHunkOverride`; switch `key_for_override` to read it; rewire
   `upsert_override_at` so `location` is authoritative for both the
-  store key and the stored `ov.origin`. **✅ Shipped this session.**
+  store key and the stored `ov.origin`. **✅ Shipped.**
+- **7c-2:** `but-db` `sub_hunk_overrides` schema v2 — add
+  `commit_id BLOB NOT NULL DEFAULT X''` column to the primary key,
+  bump `OVERRIDE_DB_SCHEMA_VERSION` to 2, widen `to_db_row` /
+  `from_db_row` to encode/decode the column. **✅ Shipped this
+  session.**
 - **7c:** add `split_hunk` variant for `(commit_id, path, anchor)`,
   validate per-range constraints exactly as the worktree path does.
 - **7d:** wrap `move_changes_between_commits` and `uncommit_changes`
@@ -1599,3 +1604,105 @@ clears them.
    pass so sub-hunk boundaries appear in the rendered diff.
 4. **Phase 7c-5** — frontend: thread `commitId` through the diff
    view's RPC choice; reuse `splitDiffHunkByHeaders` unchanged.
+
+## What landed in the phase 7c-2 session
+
+### Phase 7c-2 — `sub_hunk_overrides` schema v2 (commit_id column)
+
+**Why this exists.** Phase 7a/7b widened the in-memory store key to
+`(SubHunkOriginLocation, HunkHeader)` and 7c-1 added `origin` to the
+`SubHunkOverride` value, but the on-disk shape was still v1: a single
+`(gitdir, path, anchor_*)` PK that could only hold one override per
+`(path, anchor)` regardless of origin. As soon as 7c-3 emits
+`Commit { id, path }`-keyed overrides via the commit-side `split_hunk`
+RPC, persistence would silently collapse worktree- and commit-keyed
+overrides into the same row.
+
+**Changes in `crates/but-db`** (`table/sub_hunk_overrides.rs`):
+
+- New M::up migration `20260501120000` that recreates the table
+  with `commit_id BLOB NOT NULL DEFAULT X''` added to the primary
+  key. Existing v1 rows are backfilled with `X''` (= worktree).
+  Strategy mirrors the existing `worktrees` rebuild migrations
+  (create new table, INSERT…SELECT old, DROP old, RENAME new → old).
+  Tagged `SchemaVersion::Zero` because old binaries that don't know
+  about line-by-line commits never touch this table; and binaries
+  that do know read everything they need via the same
+  `SELECT_COLUMNS` (which just gained the column) and emit upserts
+  with the new shape.
+- `SubHunkOverrideRow` gains `pub commit_id: Vec<u8>` with
+  `#[serde(default)]` for backward-compat against in-memory
+  snapshots that may pre-date 7c-2.
+- `SELECT_COLUMNS` and `map_row` widened.
+- `get` and `delete` now take a `commit_id: &[u8]` parameter.
+- `upsert` plumbs `row.commit_id` through both the INSERT clause
+  and the ON CONFLICT predicate.
+
+**Changes in `crates/but-hunk-assignment`** (`sub_hunk.rs`):
+
+- `OVERRIDE_DB_SCHEMA_VERSION` bumped from `1` to `2`. The
+  `from_db_row` schema-version check now rejects anything not
+  exactly `2` (consistent with the existing forward-incompat
+  policy).
+- `to_db_row` encodes `ov.origin`'s commit id into the row's
+  `commit_id` field: empty `Vec::new()` for `Worktree`, the OID's
+  raw bytes (sha1-20 / sha256-32) for `Commit`.
+- `from_db_row` decodes: empty → `SubHunkOriginLocation::worktree`,
+  non-empty → `gix::ObjectId::try_from(bytes)` →
+  `SubHunkOriginLocation::commit`. Parse failures bubble up as
+  errors so corrupt rows surface loudly rather than getting
+  silently coerced to worktree.
+- New helper `origin_commit_id_bytes(origin) -> Vec<u8>` for the
+  size-guard delete path that doesn't have a `to_db_row` candidate
+  to pull from.
+- `upsert_override_persistent` size-guard delete and all five
+  `.delete()` callers updated to pass `commit_id`. Worktree-only
+  paths (`remove_override_persistent`, `drop_overrides_persistent`,
+  the `reconcile_with_overrides_persistent` join) hard-code
+  `&[]`. The reconcile pass now filters disk rows to
+  `commit_id.is_empty()` so a future commit-anchored row on disk
+  doesn't get incorrectly deleted as part of a worktree reconcile.
+
+**Tests** (3 new — 1 in `but-db`, 2 in `but-hunk-assignment`):
+
+- `but-db`: `primary_key_distinguishes_commit_id` — insert a
+  worktree row (`commit_id = b""`) and a commit row (sentinel
+  20-byte blob) on the same `(path, anchor)`; verify both coexist;
+  `get` and `delete` discriminate correctly by commit_id.
+- `but-hunk-assignment`:
+  `commit_keyed_override_round_trips_through_db_bridge` — build
+  a `Commit { id, path }`-origin override, run it through
+  `to_db_row` → `from_db_row`, verify the origin survives and
+  `row.commit_id == id.as_bytes()`.
+- `but-hunk-assignment`:
+  `worktree_keyed_override_encodes_empty_commit_id` — symmetric
+  case: worktree-anchored overrides encode an empty `commit_id`
+  blob and decode back to the `Worktree` variant.
+- Plus updates to existing snapshot tests in `but-db`'s
+  `migration::run::run_ours` to reflect the new table shape and
+  the new migration timestamp.
+
+**Test totals after this session:** `but-db` 133, `but-hunk-assignment`
+88 — all green; workspace builds clean (the pre-existing `crates/but`
+insta drift on `sub_hunk_origin` indentation is still present and
+still independent).
+
+### Recommended next-session pickup
+
+1. **Phase 7c-3** — `split_hunk_in_commit` and
+   `unsplit_hunk_in_commit` RPCs in `crates/but-api/src/diff.rs`.
+   Same shape as the worktree variants but routing through
+   `upsert_override_at` /
+   `remove_override` (a new variant of the latter that takes a
+   `SubHunkOriginLocation`) with a `Commit { id }` location.
+   Tauri allowlist + napi entries + frontend type stubs.
+2. **Phase 7c-4** — commit-diff override-aware RPC. The desktop's
+   `tree_change_diffs` returns a `UnifiedPatch`; add a
+   `tree_change_diffs_in_commit(commit_id, change)` that wraps the
+   patch's hunks through a commit-side override-materialization
+   pass so sub-hunk boundaries appear in the rendered diff.
+3. **Phase 7c-5** — frontend: thread `commitId` through the diff
+   view's RPC choice; reuse `splitDiffHunkByHeaders` unchanged.
+4. Phase 7d / 7f remain untouched (move + uncommit of sub-hunks,
+   override migration on commit rewrite). 7c-3..5 are the path
+   to user-visible commit-side splits.

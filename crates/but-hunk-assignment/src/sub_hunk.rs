@@ -1468,8 +1468,12 @@ pub fn reconcile_with_overrides(gitdir: &Path, assignments: &mut Vec<HunkAssignm
 /// keeps DB rows bounded.
 pub const MAX_OVERRIDE_DB_BYTES: usize = 64 * 1024;
 
-/// Current on-disk schema version stamped into `sub_hunk_overrides.schema_version`.
-pub const OVERRIDE_DB_SCHEMA_VERSION: u32 = 1;
+/// Current on-disk schema version stamped into
+/// `sub_hunk_overrides.schema_version`. Bumped to `2` in Phase 7c-2
+/// when the table gained a `commit_id BLOB` column in the primary
+/// key. Rows written at v1 carry an empty-blob `commit_id` (NULL
+/// equivalent) and are interpreted as worktree-anchored on read.
+pub const OVERRIDE_DB_SCHEMA_VERSION: u32 = 2;
 
 /// Convert an in-memory `SubHunkOverride` into the on-disk row shape.
 ///
@@ -1499,6 +1503,14 @@ pub fn to_db_row(
         return Ok(None);
     }
 
+    // Phase 7c-2: encode the override's origin into `commit_id`.
+    // Worktree-anchored → empty blob; commit-anchored → the commit
+    // OID's raw 20-byte (sha1) / 32-byte (sha256) representation.
+    let commit_id = match &ov.origin {
+        SubHunkOriginLocation::Worktree { .. } => Vec::new(),
+        SubHunkOriginLocation::Commit { id, .. } => id.as_bytes().to_vec(),
+    };
+
     Ok(Some(but_db::SubHunkOverrideRow {
         gitdir: gitdir.to_string_lossy().into_owned(),
         path: ov.path.to_vec(),
@@ -1506,6 +1518,7 @@ pub fn to_db_row(
         anchor_old_lines: ov.anchor.old_lines,
         anchor_new_start: ov.anchor.new_start,
         anchor_new_lines: ov.anchor.new_lines,
+        commit_id,
         ranges_json,
         assignments_json,
         rows_json,
@@ -1531,12 +1544,19 @@ pub fn from_db_row(row: but_db::SubHunkOverrideRow) -> Result<SubHunkOverride> {
         serde_json::from_str(&row.assignments_json)?;
     let assignments: BTreeMap<RowRange, HunkAssignmentTarget> = pairs.into_iter().collect();
 
-    // Phase 7c-1: synthesize `origin` for legacy v1 rows (which
-    // have no `commit_id` column). Phase 7c-2's schema bump adds
-    // the column and reads it directly here.
+    // Phase 7c-2: decode origin from `row.commit_id`. Empty blob
+    // → worktree-anchored. Non-empty → parse as `gix::ObjectId`
+    // (handles both sha1-20 and sha256-32 byte widths).
     let path = BString::from(row.path);
+    let origin = if row.commit_id.is_empty() {
+        SubHunkOriginLocation::worktree(path.clone())
+    } else {
+        let id = gix::ObjectId::try_from(row.commit_id.as_slice())
+            .map_err(|err| anyhow::anyhow!("sub_hunk_overrides.commit_id is not a valid object id: {err}"))?;
+        SubHunkOriginLocation::commit(id, path.clone())
+    };
     Ok(SubHunkOverride {
-        origin: SubHunkOriginLocation::worktree(path.clone()),
+        origin,
         path,
         anchor: HunkHeader {
             old_start: row.anchor_old_start,
@@ -1639,6 +1659,7 @@ pub fn upsert_override_persistent(
             // Refused for size. Make sure no stale row is left behind
             // (e.g. from an earlier, smaller version of the same anchor).
             let key = gitdir_key(gitdir);
+            let commit_id_bytes = origin_commit_id_bytes(&ov.origin);
             let _ = db.sub_hunk_overrides_mut().delete(
                 &key,
                 &ov.path,
@@ -1646,13 +1667,16 @@ pub fn upsert_override_persistent(
                 ov.anchor.old_lines,
                 ov.anchor.new_start,
                 ov.anchor.new_lines,
+                &commit_id_bytes,
             )?;
             Ok(false)
         }
     }
 }
 
-/// Remove `(path, anchor)` both in memory and on disk.
+/// Remove `(path, anchor)` both in memory and on disk
+/// (worktree-anchored). Commit-anchored removals reach the disk
+/// through Phase 7c-3's `unsplit_hunk_in_commit` RPC.
 pub fn remove_override_persistent(
     db: &mut but_db::DbHandle,
     gitdir: &Path,
@@ -1669,11 +1693,14 @@ pub fn remove_override_persistent(
         anchor.old_lines,
         anchor.new_start,
         anchor.new_lines,
+        &[],
     )?;
     Ok(removed)
 }
 
 /// Drop every override in `keys` both in memory and on disk.
+/// Worktree-anchored only — the `BString`-shaped key implies a
+/// `commit_id = b""` row.
 pub fn drop_overrides_persistent(
     db: &mut but_db::DbHandle,
     gitdir: &Path,
@@ -1693,9 +1720,19 @@ pub fn drop_overrides_persistent(
             anchor.old_lines,
             anchor.new_start,
             anchor.new_lines,
+            &[],
         )?;
     }
     Ok(())
+}
+
+/// Encode an origin's commit id into the on-disk `commit_id` blob.
+/// Worktree-anchored → empty. Commit-anchored → the OID bytes.
+fn origin_commit_id_bytes(origin: &SubHunkOriginLocation) -> Vec<u8> {
+    match origin {
+        SubHunkOriginLocation::Worktree { .. } => Vec::new(),
+        SubHunkOriginLocation::Commit { id, .. } => id.as_bytes().to_vec(),
+    }
 }
 
 /// `reconcile_with_overrides` plus DB write-through for any overrides that
@@ -1718,18 +1755,18 @@ pub fn reconcile_with_overrides_persistent(
     ensure_hydrated(db, gitdir);
     reconcile_with_overrides(gitdir, assignments);
 
-    // Phase 7a note: both `disk_keyed` and `mem_keyed` below are
-    // intentionally `(BString, HunkHeader)`-keyed rather than
-    // `StoreKey`-keyed. Persistence today is worktree-only (the
-    // `sub_hunk_overrides` table has no `commit_id` column), and
-    // the in-memory store only ever contains `Worktree`-shaped keys
-    // because nothing constructs `Commit`-shaped keys yet. Phase 7c
-    // adds the `commit_id` column + a v2 schema bump and widens both
-    // sides here.
+    // Phase 7c-2: this reconcile pass is still intentionally
+    // worktree-only. The disk side now has a `commit_id` column
+    // (Phase 7c-2's v2 schema), so we filter to rows with
+    // `commit_id.is_empty()` to mirror the worktree-only memory
+    // side. Commit-anchored reconcile (against a commit's diff,
+    // not the worktree) is a separate pass introduced when 7c-3
+    // wires the commit-side `split_hunk_in_commit` RPC.
     let key = gitdir_key(gitdir);
     let disk_rows = db.sub_hunk_overrides().list_for_gitdir(&key)?;
     let disk_keyed: HashMap<(BString, HunkHeader), but_db::SubHunkOverrideRow> = disk_rows
         .into_iter()
+        .filter(|row| row.commit_id.is_empty())
         .map(|row| {
             let key = (
                 BString::from(row.path.clone()),
@@ -1744,12 +1781,6 @@ pub fn reconcile_with_overrides_persistent(
         })
         .collect();
 
-    // Phase 7b: persistence is worktree-only today (the
-    // `sub_hunk_overrides` table has no `commit_id` column). The
-    // disk vs memory join therefore restricts the memory side to
-    // worktree-anchored overrides, mirroring what's actually
-    // persistable. Phase 7c widens the schema and this filter
-    // together.
     let mem_overrides = list_worktree_overrides(gitdir);
     let mem_keyed: HashMap<(BString, HunkHeader), &SubHunkOverride> = mem_overrides
         .iter()
@@ -1768,6 +1799,7 @@ pub fn reconcile_with_overrides_persistent(
                 k.1.old_lines,
                 k.1.new_start,
                 k.1.new_lines,
+                &[],
             )?;
         }
     }
@@ -1787,6 +1819,7 @@ pub fn reconcile_with_overrides_persistent(
                     k.1.old_lines,
                     k.1.new_start,
                     k.1.new_lines,
+                    &[],
                 )?;
                 continue;
             }
@@ -3206,6 +3239,7 @@ mod tests {
                 anchor_old_lines: 1,
                 anchor_new_start: 99,
                 anchor_new_lines: 1,
+                commit_id: Vec::new(),
                 ranges_json: "[]".to_string(),
                 assignments_json: "[]".to_string(),
                 rows_json: "[]".to_string(),
@@ -3238,6 +3272,7 @@ mod tests {
                 anchor_old_lines: 1,
                 anchor_new_start: 1,
                 anchor_new_lines: 1,
+                commit_id: Vec::new(),
                 ranges_json: "not-json".to_string(),
                 assignments_json: "[]".to_string(),
                 rows_json: "[]".to_string(),
@@ -3575,6 +3610,75 @@ mod tests {
             "upsert_override_at must rewrite ov.origin to match location"
         );
 
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn commit_keyed_override_round_trips_through_db_bridge() {
+        // Phase 7c-2: build a Commit-keyed override, push it through
+        // `to_db_row` → DB → `from_db_row`, and verify the origin
+        // survives. The fixed_commit() helper produces a known
+        // ObjectId; the bridge must preserve its raw bytes.
+        let gitdir = std::path::PathBuf::from(format!(
+            "/tmp/gitbutler-test-7c2-{}",
+            uuid::Uuid::new_v4()
+        ));
+        clear_store_for_tests_at(Some(&gitdir));
+
+        let commit = fixed_commit(b'5');
+        let path = BString::from("foo.rs");
+        let mut ov = make_stored_override(
+            anchor(),
+            sample_diff(),
+            vec![RowRange { start: 2, end: 4 }],
+            BTreeMap::new(),
+        );
+        ov.origin = SubHunkOriginLocation::commit(commit, path.clone());
+
+        let row = to_db_row(&gitdir, &ov)
+            .expect("to_db_row")
+            .expect("row not size-guarded");
+        assert_eq!(
+            row.commit_id,
+            commit.as_bytes().to_vec(),
+            "commit_id encoded as raw bytes"
+        );
+        assert_eq!(row.schema_version, OVERRIDE_DB_SCHEMA_VERSION);
+
+        let restored = from_db_row(row).expect("from_db_row");
+        assert_eq!(
+            restored.origin,
+            SubHunkOriginLocation::commit(commit, path.clone()),
+            "origin survives the round trip"
+        );
+        assert_eq!(restored.path, path);
+        assert_eq!(restored.anchor, anchor());
+
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn worktree_keyed_override_encodes_empty_commit_id() {
+        // Symmetric to the test above: worktree-anchored overrides
+        // encode an empty `commit_id` blob.
+        let gitdir = std::path::PathBuf::from(format!(
+            "/tmp/gitbutler-test-7c2-wt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        clear_store_for_tests_at(Some(&gitdir));
+        let ov = make_stored_override(
+            anchor(),
+            sample_diff(),
+            vec![RowRange { start: 2, end: 4 }],
+            BTreeMap::new(),
+        );
+        let row = to_db_row(&gitdir, &ov).unwrap().unwrap();
+        assert!(row.commit_id.is_empty(), "worktree → empty commit_id");
+        let restored = from_db_row(row).unwrap();
+        assert!(matches!(
+            restored.origin,
+            SubHunkOriginLocation::Worktree { .. }
+        ));
         clear_store_for_tests_at(Some(&gitdir));
     }
 
