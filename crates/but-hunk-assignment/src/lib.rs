@@ -15,12 +15,13 @@ pub mod sub_hunk;
 
 pub use sub_hunk::{
     MAX_OVERRIDE_DB_BYTES, OVERRIDE_DB_SCHEMA_VERSION, RowRange, SubHunkOrigin,
-    SubHunkOverride, drop_overrides, drop_overrides_persistent,
-    encode_sub_hunk_for_commit, ensure_hydrated, from_db_row, get_override,
-    hydrate_from_db,
-    list_overrides, merge_user_ranges_into_partition, reconcile_with_overrides,
+    SubHunkOriginLocation, SubHunkOverride, drop_overrides,
+    drop_overrides_persistent, encode_sub_hunk_for_commit, ensure_hydrated,
+    from_db_row, get_commit_override, get_override, hydrate_from_db,
+    list_commit_overrides, list_overrides, list_worktree_overrides,
+    merge_user_ranges_into_partition, reconcile_with_overrides,
     reconcile_with_overrides_persistent, remove_override,
-    remove_override_persistent, to_db_row, upsert_override,
+    remove_override_persistent, to_db_row, upsert_override, upsert_override_at,
     upsert_override_persistent,
 };
 

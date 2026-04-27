@@ -434,9 +434,13 @@ worktree path uses, scoped to a specific source commit.
   unchanged. **✅ Shipped.**
 - **7b:** wire commit diffs through `reconcile_with_overrides`-style
   pass so committed hunks render with the split icon when an override
-  exists. **✅ Backend foundation shipped this session** (commit-side
-  query helpers + worktree-reconcile isolation; RPC + frontend wiring
+  exists. **✅ Backend foundation shipped** (commit-side query
+  helpers + worktree-reconcile isolation; RPC + frontend wiring
   follows in 7c).
+- **7c-1:** add `pub origin: SubHunkOriginLocation` to
+  `SubHunkOverride`; switch `key_for_override` to read it; rewire
+  `upsert_override_at` so `location` is authoritative for both the
+  store key and the stored `ov.origin`. **✅ Shipped this session.**
 - **7c:** add `split_hunk` variant for `(commit_id, path, anchor)`,
   validate per-range constraints exactly as the worktree path does.
 - **7d:** wrap `move_changes_between_commits` and `uncommit_changes`
@@ -1473,3 +1477,125 @@ consume.
    sub-ranges, encoding via the existing `encode_sub_hunk_for_commit`.
 3. The open partial-commit duplication bug remains independent of
    phase 7 keying and worth interleaving whenever convenient.
+
+## What landed in the phase 7c-1 session
+
+### Phase 7c-1 — `SubHunkOverride.origin` field
+
+**Why this exists.** Phase 7a/7b widened the in-memory store key to
+`(SubHunkOriginLocation, HunkHeader)` but kept the override **value**
+ignorant of where it was anchored — `key_for_override(ov)`
+unconditionally constructed `Worktree { path: ov.path.clone() }`.
+That meant any code holding a `SubHunkOverride` *outside* the store
+(migration helpers, the upcoming 7d `move_sub_hunk` RPC, future
+disk-row bridging) couldn't tell whether it was looking at a
+worktree- or commit-anchored override without knowing which key it
+came from. The plan doc explicitly flagged this as 7b/c follow-up.
+
+7c-1 closes that gap so 7c-2 (DB schema v2) and 7c-3+ (commit-side
+RPCs) can be written cleanly.
+
+**Changes** (all in `crates/but-hunk-assignment/src/sub_hunk.rs`,
+exported from `lib.rs`):
+
+- `SubHunkOverride` gains `pub origin: SubHunkOriginLocation` with
+  `#[serde(default = "...")]` so legacy snapshots without the field
+  deserialize as a sentinel empty-path Worktree variant. The
+  hydration / read path is responsible for filling in the real
+  origin from the surrounding `(path, commit_id?)` context.
+- `SubHunkOriginLocation` gets an `impl Default` (empty-path
+  Worktree) and a `default_for_serde` helper used as the field's
+  serde default.
+- Invariant: `origin.path() == &self.path`. Documented inline; the
+  redundant `path` field is retained for backward compat with the
+  ~40 read sites that access `ov.path` directly. A future cleanup
+  may replace `path` with a `pub fn path(&self) -> &BString`
+  accessor.
+- `key_for_override(ov)` now reads `ov.origin` directly. The
+  worktree-only shim from 7a/7b is retired.
+- `upsert_override(gitdir, ov)` reads `ov.origin` as authoritative
+  (no more silent worktree assumption).
+- `upsert_override_at(gitdir, location, mut ov)` overwrites
+  `ov.origin = location.clone()` before storing, so callers can
+  hand in a stale-origin `ov` and the stored value's `origin`
+  always matches its key.
+- All 9 `SubHunkOverride { ... }` construction sites updated to
+  populate `origin`:
+  - migration paths (`migrate_override_multi`, `migrate_override`)
+    inherit `ov.origin.clone()` from the source — a worktree-side
+    migration stays worktree-shaped, a commit-side migration
+    (Phase 7f) stays commit-shaped.
+  - `from_db_row` synthesizes `Worktree { path }` because v1 rows
+    have no `commit_id` column. Phase 7c-2 reads the new column
+    directly.
+  - test helpers + `but-api/src/diff.rs::split_hunk_with_perm`
+    construct `Worktree { path }` explicitly.
+- New public exports: `SubHunkOriginLocation`, `upsert_override_at`,
+  `list_worktree_overrides`, `list_commit_overrides`,
+  `get_commit_override`.
+
+**Bug fix flushed out by this session.** The pre-existing test
+`reconcile_with_overrides_prunes_stale_entries` constructed an
+override via `make_stored_override` (path "foo.rs") then mutated
+`stale.path = "missing.rs"` post-construction. Pre-7c-1 the store
+key derived from `ov.path`, so the mutation moved the entry's key
+along with the field. Post-7c-1 the key derives from `ov.origin`,
+so the bare `path` mutation desynchronized the key from the value.
+The test now updates both `path` and `origin` together. This
+exposes a coherent contract: callers that mutate `ov.path` directly
+must also update `ov.origin` (or use `upsert_override_at` which
+takes the location authoritatively). The struct-level
+`debug_assert_eq!` in `upsert_override_at` enforces it.
+
+**Tests** (3 new, total 86 in `but-hunk-assignment`):
+
+- `upsert_override_routes_through_origin_field` — set `ov.origin`
+  to a `Commit { id, path }` shape and call the bare
+  `upsert_override`; the entry lands under the commit-keyed slot,
+  not under the worktree-keyed one implied by `ov.path`.
+- `upsert_override_at_overrides_origin_field_for_storage` — pass a
+  `Worktree`-origin `ov` plus a `Commit { id }` location to
+  `upsert_override_at`; verify `stored.origin == location` after
+  retrieval.
+- `sub_hunk_override_serde_default_origin_for_legacy_snapshots` —
+  parse a legacy in-memory snapshot JSON without the `origin`
+  field; verify `#[serde(default)]` fires and the field is filled
+  with the empty-path Worktree sentinel.
+
+### Pre-existing test drift (unrelated)
+
+`cargo test --workspace` shows 11 failures in `crates/but/src/id/tests.rs`
+(insta snapshot whitespace drift on `sub_hunk_origin: None,` rows).
+Confirmed identical on `master` pre-session via `git stash` + retest.
+Not caused by 7c-1; flagged here so it doesn't get attributed to a
+later phase. A snapshot review (`cargo insta review` in `crates/but`)
+clears them.
+
+### Recommended next-session pickup
+
+1. **Phase 7c-2** — `but-db` `sub_hunk_overrides` schema v2:
+   - Add `commit_id BLOB` column (nullable; null \u2261 worktree).
+   - Bump `OVERRIDE_DB_SCHEMA_VERSION` to 2 with a Diesel migration
+     under `crates/but-db/migrations/`.
+   - Update `to_db_row` / `from_db_row` to read/write the column;
+     `from_db_row` builds the right `SubHunkOriginLocation` variant
+     directly instead of always Worktree.
+   - The reconcile join in `reconcile_with_overrides_persistent`
+     widens both sides to the new key shape (the pre-existing
+     comment in that function documents this is the planned
+     widening point).
+   - Add tests for v1 \u2192 v2 row migration on hydration (existing
+     v1 rows hydrate as Worktree-keyed; v2 rows with non-null
+     `commit_id` hydrate as Commit-keyed).
+2. **Phase 7c-3** — `split_hunk_in_commit` + `unsplit_hunk_in_commit`
+   RPCs in `crates/but-api/src/diff.rs`. Same shape as the worktree
+   variants but routing through `upsert_override_at` /
+   `remove_override` with a `Commit { id }` location. Tauri
+   allowlist + napi entries; frontend type stubs.
+3. **Phase 7c-4** — commit-diff override-aware RPC. The desktop's
+   `tree_change_diffs` returns a `UnifiedPatch`; add a
+   `tree_change_diffs_in_commit(commit_id, change)` that wraps the
+   patch's hunks through a commit-side override-materialization
+   pass so sub-hunk boundaries appear in the rendered diff.
+4. **Phase 7c-5** — frontend: thread `commitId` through the diff
+   view's RPC choice; reuse `splitDiffHunkByHeaders` unchanged.

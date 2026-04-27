@@ -376,6 +376,9 @@ pub fn split_hunk_with_perm(
         &mut db,
         &gitdir,
         SubHunkOverride {
+            origin: but_hunk_assignment::SubHunkOriginLocation::worktree(
+                path.clone(),
+            ),
             path: path.clone(),
             anchor,
             ranges: stored_ranges,

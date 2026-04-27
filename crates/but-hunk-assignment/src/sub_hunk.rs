@@ -131,6 +131,28 @@ pub enum SubHunkOriginLocation {
     },
 }
 
+impl Default for SubHunkOriginLocation {
+    /// Empty-path worktree variant. Useful only as a serde default for
+    /// [`SubHunkOverride::origin`] so backward-compat snapshots without
+    /// the field deserialize cleanly; live callers should always
+    /// construct via [`Self::worktree`] or [`Self::commit`].
+    fn default() -> Self {
+        Self::Worktree {
+            path: BString::default(),
+        }
+    }
+}
+
+impl SubHunkOriginLocation {
+    /// Sentinel default used by `#[serde(default)]` on
+    /// [`SubHunkOverride::origin`]. The hydration path overwrites it
+    /// with the canonical worktree-shaped origin built from
+    /// `SubHunkOverride::path`.
+    pub fn default_for_serde() -> Self {
+        Self::default()
+    }
+}
+
 impl SubHunkOriginLocation {
     /// Construct a worktree-anchored override key for `path`.
     pub fn worktree(path: BString) -> Self {
@@ -204,6 +226,22 @@ pub struct SubHunkOrigin {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubHunkOverride {
+    /// Where this override is anchored. Phase 7c (line-by-line commits)
+    /// uses this to disambiguate worktree-anchored overrides from
+    /// overrides anchored to a hunk inside a specific commit's diff.
+    ///
+    /// Invariant: `origin.path() == &self.path`. The redundant `path`
+    /// field is retained as a convenience for the many existing
+    /// callers that read `ov.path` directly; a future cleanup may
+    /// replace it with a `pub fn path(&self) -> &BString` accessor.
+    ///
+    /// `#[serde(default)]` so older on-disk / in-memory snapshots
+    /// without this field deserialize as worktree-anchored. The
+    /// default value is patched up post-deserialize when reading
+    /// from the `sub_hunk_overrides` table; the JSON-roundtrip path
+    /// always carries the field.
+    #[serde(default = "SubHunkOriginLocation::default_for_serde")]
+    pub origin: SubHunkOriginLocation,
     pub path: BString,
     pub anchor: HunkHeader,
     /// Sorted, disjoint, non-empty, all contained within the anchor. Covers
@@ -936,6 +974,7 @@ fn migrate_override_multi(
         out.push((
             idx,
             SubHunkOverride {
+                origin: ov.origin.clone(),
                 path: ov.path.clone(),
                 anchor: c.anchor,
                 ranges,
@@ -1044,6 +1083,7 @@ fn migrate_override(
     Some((
         i,
         SubHunkOverride {
+            origin: ov.origin.clone(),
             path: ov.path.clone(),
             anchor: new_anchor,
             ranges: new_ranges,
@@ -1120,12 +1160,11 @@ fn worktree_key(path: &BString, anchor: HunkHeader) -> StoreKey {
     (SubHunkOriginLocation::worktree(path.clone()), anchor)
 }
 
-/// Build the store key implied by `ov`'s current shape. Today every
-/// `SubHunkOverride` is implicitly worktree-anchored; once the
-/// `SubHunkOverride` struct gains an explicit `origin` field (Phase
-/// 7b/c follow-up), this function will read it directly.
+/// Build the store key for `ov`. Phase 7c reads `ov.origin` directly
+/// (the field is now authoritative); the older worktree-only shim
+/// from 7a/7b has been retired.
 fn key_for_override(ov: &SubHunkOverride) -> StoreKey {
-    (SubHunkOriginLocation::worktree(ov.path.clone()), ov.anchor)
+    (ov.origin.clone(), ov.anchor)
 }
 
 /// List **all** overrides for the project at `gitdir`, regardless of
@@ -1173,35 +1212,37 @@ where
         .unwrap_or_default()
 }
 
-/// Insert or replace an override (worktree-anchored). Equivalent to
-/// [`upsert_override_at`] with a `Worktree`-shaped location.
+/// Insert or replace an override. Reads the override's own
+/// [`SubHunkOverride::origin`] field as the authoritative store key.
 pub fn upsert_override(gitdir: &Path, ov: SubHunkOverride) {
-    upsert_override_at(
-        gitdir,
-        SubHunkOriginLocation::worktree(ov.path.clone()),
-        ov,
-    );
+    let key = key_for_override(&ov);
+    let mut store = global_store().lock().expect("override store poisoned");
+    let project = store.entry(gitdir.to_path_buf()).or_default();
+    project.insert(key, ov);
 }
 
 /// Insert or replace an override at an explicit
-/// [`SubHunkOriginLocation`]. The `location.path()` is expected to
-/// equal `ov.path` (the field is retained for backward compatibility;
-/// see also `key_for_override`'s deferred-refactor doc-comment).
+/// [`SubHunkOriginLocation`], overriding `ov.origin` for storage.
+/// `location` is authoritative for both the store key and the stored
+/// `ov.origin` field, so callers can hand in an `ov` constructed
+/// without yet knowing its origin (e.g. migration paths that build a
+/// `SubHunkOverride` from on-disk pieces and only know the location
+/// at insert time).
 ///
-/// Phase 7c uses this to insert `Commit`-keyed overrides via the
-/// commit-side `split_hunk` RPC. Phase 7b only constructs
-/// `Worktree`-keyed overrides through this entry point (via
-/// [`upsert_override`]).
+/// Phase 7c's commit-side `split_hunk_in_commit` RPC enters here
+/// with a `Commit { id, path }`-shaped location; existing worktree
+/// callers reach the in-memory store through [`upsert_override`].
 pub fn upsert_override_at(
     gitdir: &Path,
     location: SubHunkOriginLocation,
-    ov: SubHunkOverride,
+    mut ov: SubHunkOverride,
 ) {
     debug_assert_eq!(
         location.path(),
         &ov.path,
         "SubHunkOriginLocation.path must agree with SubHunkOverride.path"
     );
+    ov.origin = location.clone();
     let anchor = ov.anchor;
     let mut store = global_store().lock().expect("override store poisoned");
     let project = store.entry(gitdir.to_path_buf()).or_default();
@@ -1490,8 +1531,13 @@ pub fn from_db_row(row: but_db::SubHunkOverrideRow) -> Result<SubHunkOverride> {
         serde_json::from_str(&row.assignments_json)?;
     let assignments: BTreeMap<RowRange, HunkAssignmentTarget> = pairs.into_iter().collect();
 
+    // Phase 7c-1: synthesize `origin` for legacy v1 rows (which
+    // have no `commit_id` column). Phase 7c-2's schema bump adds
+    // the column and reads it directly here.
+    let path = BString::from(row.path);
     Ok(SubHunkOverride {
-        path: BString::from(row.path),
+        origin: SubHunkOriginLocation::worktree(path.clone()),
+        path,
         anchor: HunkHeader {
             old_start: row.anchor_old_start,
             old_lines: row.anchor_old_lines,
@@ -1920,8 +1966,10 @@ mod tests {
     ) -> SubHunkOverride {
         let kinds = parse_row_kinds(diff.as_ref());
         let ranges = materialize_residual_ranges(&user_ranges, &kinds);
+        let path = BString::from("foo.rs");
         SubHunkOverride {
-            path: BString::from("foo.rs"),
+            origin: SubHunkOriginLocation::worktree(path.clone()),
+            path,
             anchor,
             ranges,
             assignments,
@@ -2176,7 +2224,9 @@ mod tests {
             vec![RowRange { start: 0, end: 2 }],
             BTreeMap::new(),
         );
-        stale.path = BString::from("missing.rs");
+        let missing = BString::from("missing.rs");
+        stale.path = missing.clone();
+        stale.origin = SubHunkOriginLocation::worktree(missing);
         upsert_override(gitdir, stale);
         upsert_override(
             gitdir,
@@ -2611,8 +2661,10 @@ mod tests {
             mid_ranges,
             vec![RowRange { start: 1, end: 2 }, RowRange { start: 3, end: 4 }]
         );
+        let path = BString::from("foo.rs");
         let ov = SubHunkOverride {
-            path: BString::from("foo.rs"),
+            origin: SubHunkOriginLocation::worktree(path.clone()),
+            path,
             anchor: mid_anchor,
             ranges: mid_ranges,
             assignments: BTreeMap::new(),
@@ -2897,8 +2949,10 @@ mod tests {
                 stack_id: stack_id.into(),
             },
         );
+        let path = BString::from("src/foo.rs");
         let original = SubHunkOverride {
-            path: BString::from("src/foo.rs"),
+            origin: SubHunkOriginLocation::worktree(path.clone()),
+            path,
             anchor: anchor(),
             ranges,
             assignments,
@@ -2908,6 +2962,7 @@ mod tests {
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: SubHunkOverride =
             serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.origin, original.origin);
         assert_eq!(restored.path, original.path);
         assert_eq!(restored.anchor, original.anchor);
         assert_eq!(restored.ranges, original.ranges);
@@ -2959,8 +3014,10 @@ mod tests {
                 stack_id: uuid::Uuid::new_v4().into(),
             },
         );
+        let path = BString::from("src/foo.rs");
         SubHunkOverride {
-            path: BString::from("src/foo.rs"),
+            origin: SubHunkOriginLocation::worktree(path.clone()),
+            path,
             anchor: anchor(),
             ranges,
             assignments,
@@ -3444,5 +3501,109 @@ mod tests {
         );
         assert!(get_commit_override(&gitdir, commit, &path, anchor()).is_some());
         clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 7c-1 — SubHunkOverride.origin field is the authoritative
+    // store key.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn upsert_override_routes_through_origin_field() {
+        // Construct an override with a `Commit`-shaped origin and
+        // call the bare `upsert_override` (no `_at` variant). It
+        // must land under the commit-keyed slot, not under the
+        // worktree-keyed one implied by `path`.
+        let gitdir = std::path::PathBuf::from(format!(
+            "/tmp/gitbutler-test-7c1-origin-{}",
+            uuid::Uuid::new_v4()
+        ));
+        clear_store_for_tests_at(Some(&gitdir));
+
+        let commit = fixed_commit(b'e');
+        let mut ov = make_stored_override(
+            anchor(),
+            sample_diff(),
+            vec![RowRange { start: 2, end: 4 }],
+            BTreeMap::new(),
+        );
+        ov.origin = SubHunkOriginLocation::commit(commit, ov.path.clone());
+        upsert_override(&gitdir, ov.clone());
+
+        // Worktree lookup misses; commit lookup hits.
+        assert!(get_override(&gitdir, &ov.path, anchor()).is_none());
+        assert!(get_commit_override(&gitdir, commit, &ov.path, anchor()).is_some());
+
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn upsert_override_at_overrides_origin_field_for_storage() {
+        // Even if `ov.origin` is stale, `upsert_override_at`
+        // overwrites it with `location` so the stored value's
+        // `origin` matches the key it was filed under.
+        let gitdir = std::path::PathBuf::from(format!(
+            "/tmp/gitbutler-test-7c1-at-{}",
+            uuid::Uuid::new_v4()
+        ));
+        clear_store_for_tests_at(Some(&gitdir));
+
+        let commit = fixed_commit(b'f');
+        let ov = make_stored_override(
+            anchor(),
+            sample_diff(),
+            vec![RowRange { start: 2, end: 4 }],
+            BTreeMap::new(),
+        );
+        // ov.origin is Worktree by construction; upsert_override_at
+        // should rewrite it to Commit.
+        let original_origin = ov.origin.clone();
+        assert!(matches!(
+            original_origin,
+            SubHunkOriginLocation::Worktree { .. }
+        ));
+        upsert_override_at(
+            &gitdir,
+            SubHunkOriginLocation::commit(commit, ov.path.clone()),
+            ov.clone(),
+        );
+        let stored = get_commit_override(&gitdir, commit, &ov.path, anchor())
+            .expect("stored under commit key");
+        assert_eq!(
+            stored.origin,
+            SubHunkOriginLocation::commit(commit, ov.path.clone()),
+            "upsert_override_at must rewrite ov.origin to match location"
+        );
+
+        clear_store_for_tests_at(Some(&gitdir));
+    }
+
+    #[test]
+    fn sub_hunk_override_serde_default_origin_for_legacy_snapshots() {
+        // Older snapshots (pre-7c-1) lack the `origin` field. Verify
+        // that `#[serde(default)]` fills it in (so an old in-memory
+        // dump deserializes), and that the default doesn't poison
+        // anything — callers downstream re-derive a real origin
+        // before storage when they have one.
+        let legacy_json = r#"{
+            "path": [115, 114, 99, 47, 102, 111, 111, 46, 114, 115],
+            "anchor": {
+                "oldStart": 10, "oldLines": 5,
+                "newStart": 10, "newLines": 5
+            },
+            "ranges": [],
+            "assignments": [],
+            "rows": [],
+            "anchorDiff": []
+        }"#;
+        let restored: SubHunkOverride = serde_json::from_str(legacy_json)
+            .expect("legacy snapshot without `origin` deserializes");
+        // Default origin is an empty-path Worktree variant; the
+        // hydration / read path is responsible for filling it in
+        // with the real path from the row.
+        assert!(matches!(
+            restored.origin,
+            SubHunkOriginLocation::Worktree { .. }
+        ));
     }
 }
