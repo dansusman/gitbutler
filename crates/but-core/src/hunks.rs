@@ -385,17 +385,72 @@ mod test {
         /// rows because the unselected pure-adds (Section A header,
         /// top-of-file lines) all sat in the same wh as the alpha
         /// lines. The clamp to `wh.old_lines` keeps the offset honest.
+        /// Mirror of the workspace-level `amend_with_section_a_above_existing_section_b`
+        /// integration test, but at the `to_additive_hunks` →
+        /// `apply_hunks` layer using the wh shape gix actually emits
+        /// (`old_start >= 1`, treating `(-N, 0, +M, K)` as "insert
+        /// before old row N").
         #[test]
         fn commit_alpha_lines_when_only_section_b_is_in_head() {
             let old = b"\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n";
             let new = b"# split test\n\nthis whole file is uncommitted\npure-add hunk\n\n## Section A\n- alpha line one\n- alpha line two\n- alpha line three\n\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n## Section C\n- gamma line one\n- gamma line two\n- gamma line three\n";
-            // Worktree-vs-HEAD: 6 old rows shared; 13 new rows added.
-            // 0-context wh splits into a top region (10 added rows, no
-            // shared rows around them) and a bottom region (3 added
-            // rows after the shared block).
+            // gix emits the natural with-context hunk as -1,6 +1,19
+            // (one big hunk because there's only 6 context rows in the
+            // middle). The no-context split breaks at the leading
+            // blank that matches HEAD's blank row 1.
             let wh_with_context = vec![h(1, 6, 1, 19)];
-            let wh_no_context = vec![h(1, 0, 1, 10), h(7, 0, 17, 3)];
-            // User drags rows 7-8 (alpha line one, alpha line two).
+            let wh_no_context = vec![h(1, 0, 1, 4), h(2, 0, 6, 5), h(7, 0, 16, 4)];
+            // User drags worktree rows 7-8 (alpha line one, alpha line two).
+            // That falls inside the second wh which spans new positions 6-10.
+            let (hunks, rejected) = to_additive_hunks_for_test(
+                vec![h(0, 0, 7, 2)],
+                &wh_with_context,
+                &wh_no_context,
+            )
+            .unwrap();
+            assert_eq!(rejected, &[] as &[HunkHeader]);
+            let result = apply_hunks(old.as_bstr(), new.as_bstr(), &hunks).unwrap();
+            // Without Section A header in HEAD, alpha lines slot at
+            // the next viable position inside the matched no-context
+            // wh — between HEAD's leading blank and the Section B
+            // block. The exact landing position is a function of
+            // git's no-context match alignment, but it must not
+            // duplicate or reorder existing HEAD content.
+            assert_eq!(
+                result.as_bstr(),
+                b"\n- alpha line one\n- alpha line two\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n".as_bstr(),
+                "alpha lines must slot into HEAD's existing row space without duplicating Section B",
+            );
+        }
+
+        /// The user-reported flow: HEAD has Section A above Section
+        /// B (the result of an earlier amend). User now drags two
+        /// alpha lines (worktree positions 7-8) to amend the same
+        /// commit further. Expected: alpha lines land *between*
+        /// Section A header and the blank that precedes Section B,
+        /// not above Section A.
+        ///
+        /// Pre-fix the alpha lines landed BEFORE Section A, producing
+        /// the field-observed `alpha\nalpha\n\n## Section A\n## Section B\n...`
+        /// shape with sections out of order.
+        /// Mirror of the workspace-level
+        /// `amend_then_amend_alpha_lines_after_section_a` integration
+        /// test at the `to_additive_hunks` → `apply_hunks` layer.
+        /// HEAD already has Section A header; user drags two alpha
+        /// lines onto a follow-up amend. The alpha lines must slot
+        /// between Section A header and the blank that precedes
+        /// Section B in HEAD's row space.
+        #[test]
+        fn alpha_lines_land_after_existing_section_a_header() {
+            let old = b"\n## Section A\n\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n";
+            let new = b"# split test\n\nthis whole file is uncommitted\npure-add hunk\n\n## Section A\n- alpha line one\n- alpha line two\n- alpha line three\n\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n## Section C\n- gamma line one\n- gamma line two\n- gamma line three\n";
+            // gix wh shape for HEAD (8 rows) vs worktree (19 rows):
+            // one big with-context hunk -1,8 +1,19, with no-context
+            // splits at the matched Section A header and the matched
+            // blank above Section B.
+            let wh_with_context = vec![h(1, 8, 1, 19)];
+            let wh_no_context = vec![h(1, 0, 1, 4), h(3, 0, 7, 3), h(8, 0, 16, 4)];
+            // User drags worktree rows 7-8 (alpha line one, alpha line two).
             let (hunks, rejected) = to_additive_hunks_for_test(
                 vec![h(0, 0, 7, 2)],
                 &wh_with_context,
@@ -406,8 +461,8 @@ mod test {
             let result = apply_hunks(old.as_bstr(), new.as_bstr(), &hunks).unwrap();
             assert_eq!(
                 result.as_bstr(),
-                b"- alpha line one\n- alpha line two\n\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n".as_bstr(),
-                "alpha lines must land above HEAD's existing Section B, not appended after it",
+                b"\n## Section A\n- alpha line one\n- alpha line two\n\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n".as_bstr(),
+                "alpha lines must slot between Section A header and the blank above Section B",
             );
         }
 

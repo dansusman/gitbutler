@@ -1,5 +1,6 @@
 use but_core::{DiffSpec, HunkHeader};
 use but_testsupport::read_only_in_memory_scenario;
+use but_workspace::commit_engine;
 use but_workspace::commit_engine::Destination;
 
 use crate::utils::{
@@ -258,6 +259,208 @@ fn signatures_are_redone() -> anyhow::Result<()> {
     3412b2c
     ├── .gitignore:100644:ccc87a0 "*.key*\n"
     └── file:100644:a07b65a "40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n57\n58\n59\n60\n"
+    "#);
+    Ok(())
+}
+
+/// Regression for the field-observed worktree-amend bug:
+/// HEAD already contains a Section B blob; user splits a multi-section
+/// pure-add worktree hunk and drags the "blank + Section A header"
+/// sub-hunk (`+5,2` in the worktree's row space) onto an existing
+/// commit to amend it. Expected: the amended commit's tree blob now
+/// has Section A inserted above the existing Section B. Pre-fix the
+/// amend produced a tree identical to the parent (no-op) because
+/// `to_additive_hunks` couldn't position the pure-add inside the
+/// natural worktree hunk and `apply_hunks` either failed or merged
+/// the change away.
+#[test]
+fn amend_with_section_a_above_existing_section_b() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario("unborn-untracked");
+    // Commit a baseline file containing only Section B (with surrounding
+    // blanks) so the worktree-amend has a non-empty existing blob.
+    let path = repo.workdir_path("splittest.md").expect("non-bare");
+    std::fs::write(
+        &path,
+        b"\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n",
+    )?;
+    let baseline = commit_engine::create_commit(
+        &repo,
+        Destination::NewCommit {
+            parent_commit_id: None,
+            message: "baseline: Section B only".into(),
+            stack_segment: None,
+        },
+        vec![DiffSpec {
+            previous_path: None,
+            path: "splittest.md".into(),
+            hunk_headers: vec![],
+        }],
+        CONTEXT_LINES,
+    )?;
+    let baseline_id = baseline
+        .new_commit
+        .expect("baseline commit was created");
+
+    // Point HEAD at the baseline so subsequent `worktree_changes` can
+    // diff against it. The `unborn-untracked` scenario starts with a
+    // symbolic HEAD pointing at `refs/heads/main`; just create the
+    // direct ref it points at.
+    let head_ref_name = repo.head_name()?.expect("not detached");
+    repo.reference(
+        head_ref_name.as_ref(),
+        baseline_id,
+        gix::refs::transaction::PreviousValue::Any,
+        "baseline",
+    )?;
+
+    // Now extend the worktree to the full A/B/C file. None of this is
+    // committed yet.
+    std::fs::write(
+        &path,
+        b"# split test\n\nthis whole file is uncommitted\npure-add hunk\n\n## Section A\n- alpha line one\n- alpha line two\n- alpha line three\n\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n## Section C\n- gamma line one\n- gamma line two\n- gamma line three\n",
+    )?;
+
+    // Drag the "blank + Section A header" sub-hunk (rows 5-6 of the
+    // worktree's row space) onto the baseline commit to amend it.
+    let outcome = commit_engine::create_commit(
+        &repo,
+        Destination::AmendCommit {
+            commit_id: baseline_id,
+            new_message: None,
+        },
+        vec![DiffSpec {
+            previous_path: None,
+            path: "splittest.md".into(),
+            hunk_headers: vec![HunkHeader {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 5,
+                new_lines: 2,
+            }],
+        }],
+        CONTEXT_LINES,
+    )?;
+    assert_eq!(
+        outcome.rejected_specs,
+        vec![],
+        "the sub-hunk drag must be accepted",
+    );
+    let new_commit_id = outcome
+        .new_commit
+        .expect("amend produced a new commit");
+    assert_ne!(
+        new_commit_id, baseline_id,
+        "amended commit must differ from the baseline (Section A was added)",
+    );
+
+    let blob = visualize_tree(&repo, &outcome)?;
+    insta::assert_snapshot!(blob, @r#"
+    002b45f
+    └── splittest.md:100644:34f1fd2 "\n## Section A\n\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n"
+    "#);
+    Ok(())
+}
+
+/// The full user-reported two-amend flow: drag Section A header
+/// sub-hunk to amend, then drag alpha lines sub-hunk to amend the
+/// rewritten commit. Expected final tree: HEAD's file contains
+/// Section A followed by the alpha lines, then Section B unchanged.
+/// Pre-fix the alpha lines landed BEFORE Section A, producing the
+/// out-of-order `alpha\nalpha\n\n## Section A\n## Section B\n...` shape
+/// the user reported in their screenshots.
+#[test]
+fn amend_then_amend_alpha_lines_after_section_a() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario("unborn-untracked");
+    let path = repo.workdir_path("splittest.md").expect("non-bare");
+    std::fs::write(
+        &path,
+        b"\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n",
+    )?;
+    let baseline = commit_engine::create_commit(
+        &repo,
+        Destination::NewCommit {
+            parent_commit_id: None,
+            message: "baseline: Section B only".into(),
+            stack_segment: None,
+        },
+        vec![DiffSpec {
+            previous_path: None,
+            path: "splittest.md".into(),
+            hunk_headers: vec![],
+        }],
+        CONTEXT_LINES,
+    )?;
+    let baseline_id = baseline.new_commit.expect("baseline created");
+    let head_ref_name = repo.head_name()?.expect("not detached");
+    repo.reference(
+        head_ref_name.as_ref(),
+        baseline_id,
+        gix::refs::transaction::PreviousValue::Any,
+        "baseline",
+    )?;
+
+    std::fs::write(
+        &path,
+        b"# split test\n\nthis whole file is uncommitted\npure-add hunk\n\n## Section A\n- alpha line one\n- alpha line two\n- alpha line three\n\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n## Section C\n- gamma line one\n- gamma line two\n- gamma line three\n",
+    )?;
+
+    // Amend #1: drag "blank + Section A header" (rows 5-6).
+    let amend1 = commit_engine::create_commit(
+        &repo,
+        Destination::AmendCommit {
+            commit_id: baseline_id,
+            new_message: None,
+        },
+        vec![DiffSpec {
+            previous_path: None,
+            path: "splittest.md".into(),
+            hunk_headers: vec![HunkHeader {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 5,
+                new_lines: 2,
+            }],
+        }],
+        CONTEXT_LINES,
+    )?;
+    assert_eq!(amend1.rejected_specs, vec![], "amend #1 accepted");
+    let after_a = amend1.new_commit.expect("amend #1 produced a commit");
+    repo.reference(
+        head_ref_name.as_ref(),
+        after_a,
+        gix::refs::transaction::PreviousValue::Any,
+        "after section A amend",
+    )?;
+
+    // Amend #2: drag alpha lines (rows 7-8 of the worktree, which is
+    // now the same shape since the worktree hasn't changed).
+    let amend2 = commit_engine::create_commit(
+        &repo,
+        Destination::AmendCommit {
+            commit_id: after_a,
+            new_message: None,
+        },
+        vec![DiffSpec {
+            previous_path: None,
+            path: "splittest.md".into(),
+            hunk_headers: vec![HunkHeader {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 7,
+                new_lines: 2,
+            }],
+        }],
+        CONTEXT_LINES,
+    )?;
+    assert_eq!(amend2.rejected_specs, vec![], "amend #2 accepted");
+
+    // Expected final tree: Section A header followed by the two alpha
+    // lines, then the existing Section B block. Pre-fix the alpha
+    // lines landed before Section A.
+    let blob = visualize_tree(&repo, &amend2)?;
+    insta::assert_snapshot!(blob, @r#"
+    46a7c0b
+    └── splittest.md:100644:e80be28 "\n## Section A\n- alpha line one\n- alpha line two\n\n## Section B\n- beta line one\n- beta line two\n- beta line three\n\n"
     "#);
     Ok(())
 }
