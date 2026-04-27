@@ -1741,6 +1741,119 @@ fn shift_is_correct_after_multiple_changes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Phase 6 polish item #1: hunk-dependency analysis on sub-hunks.
+///
+/// Sub-hunks produced by the `but-hunk-assignment` override pass are
+/// just *narrower numeric ranges* of an existing natural worktree hunk
+/// (same path, contained `(new_start, new_lines)`). The hunk-dependency
+/// engine is intentionally agnostic to whether a queried range was
+/// produced by a natural hunk or a sub-hunk — it consumes plain
+/// `(start, lines)` pairs via `PathRanges::intersects`. These tests
+/// pin that contract so a future regression that special-cases
+/// sub-hunks (e.g. by widening intersection back to the parent
+/// anchor) fails loudly.
+#[test]
+fn sub_hunk_narrower_range_locks_only_overlapping_slice() -> anyhow::Result<()> {
+    // Committed change: modify exactly line 4 in a 7-line file.
+    let committed = input_hunk_from_unified_diff(
+        "@@ -1,7 +1,7 @@
+1
+2
+3
+-4
++x
+5
+6
+7
+",
+    )?;
+    let stack_ranges = &mut PathRanges::default();
+    let target = HunkLockTarget::Stack(StackId::generate());
+    let commit_id = id_from_hex_char('a');
+    stack_ranges.add(
+        target,
+        commit_id,
+        TreeStatusKind::Modification,
+        vec![committed],
+    )?;
+
+    // Sanity: the *natural* worktree hunk spanning the whole file locks.
+    let natural = intersect(stack_ranges, 1, 7);
+    assert_eq!(natural.len(), 1);
+    assert_eq!(natural[0].commit_id, commit_id);
+
+    // The user splits that natural hunk into three sub-hunks — rows
+    // 1..=3, 4..=4, 5..=7. Only the middle sub-hunk overlaps the
+    // committed line.
+    let above = intersect(stack_ranges, 1, 3);
+    assert!(
+        above.is_empty(),
+        "sub-hunk above the committed line must not lock"
+    );
+
+    let middle = intersect(stack_ranges, 4, 1);
+    assert_eq!(middle.len(), 1);
+    assert_eq!(middle[0].commit_id, commit_id);
+
+    let below = intersect(stack_ranges, 5, 3);
+    assert!(
+        below.is_empty(),
+        "sub-hunk below the committed line must not lock"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn sub_hunk_one_row_lock_at_committed_addition_boundary() -> anyhow::Result<()> {
+    // Committed change: pure-addition of 5 rows starting at new-side line 4.
+    let committed = input_hunk_from_unified_diff(
+        "@@ -3,1 +3,6 @@
+3
++a
++a
++a
++a
++a
+",
+    )?;
+    let stack_ranges = &mut PathRanges::default();
+    let target = HunkLockTarget::Stack(StackId::generate());
+    let commit_id = id_from_hex_char('a');
+    stack_ranges.add(
+        target,
+        commit_id,
+        TreeStatusKind::Addition,
+        vec![committed],
+    )?;
+
+    // 1-row sub-hunks at every line of the committed addition window
+    // (4..=8) lock; 1-row sub-hunks just outside don't.
+    for new_start in 4..=8 {
+        let inside = intersect(stack_ranges, new_start, 1);
+        assert_eq!(
+            inside.len(),
+            1,
+            "1-row sub-hunk at line {new_start} should lock"
+        );
+        assert_eq!(inside[0].commit_id, commit_id);
+    }
+
+    let just_above = intersect(stack_ranges, 3, 1);
+    assert!(
+        just_above.is_empty(),
+        "1-row sub-hunk just before the committed addition must not lock"
+    );
+
+    let just_below = intersect(stack_ranges, 9, 1);
+    assert!(
+        just_below.is_empty(),
+        "1-row sub-hunk just after the committed addition must not lock"
+    );
+
+    Ok(())
+}
+
 pub fn intersect(ranges: &PathRanges, start: u32, lines: u32) -> Vec<&HunkRange> {
     ranges
         .hunk_ranges
