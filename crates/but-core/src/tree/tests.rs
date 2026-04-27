@@ -54,8 +54,8 @@ mod to_additive_hunks {
         (
             [
                 HunkHeader("-1,1", "+1,0"),
-                HunkHeader("-5,2", "+1,0"),
-                HunkHeader("-10,1", "+1,0"),
+                HunkHeader("-5,2", "+4,0"),
+                HunkHeader("-10,1", "+7,0"),
             ],
             [],
         )
@@ -72,8 +72,8 @@ mod to_additive_hunks {
         (
             [
                 HunkHeader("-1,0", "+1,1"),
-                HunkHeader("-1,0", "+5,2"),
-                HunkHeader("-1,0", "+10,1"),
+                HunkHeader("-4,0", "+5,2"),
+                HunkHeader("-7,0", "+10,1"),
             ],
             [],
         )
@@ -90,8 +90,8 @@ mod to_additive_hunks {
         (
             [
                 HunkHeader("-1,0", "+1,1"),
-                HunkHeader("-5,2", "+2,0"),
-                HunkHeader("-7,0", "+10,1"),
+                HunkHeader("-5,2", "+6,0"),
+                HunkHeader("-11,0", "+10,1"),
             ],
             [],
         )
@@ -108,8 +108,8 @@ mod to_additive_hunks {
         (
             [
                 HunkHeader("-1,1", "+1,0"),
-                HunkHeader("-2,0", "+5,2"),
-                HunkHeader("-10,1", "+7,0"),
+                HunkHeader("-6,0", "+5,2"),
+                HunkHeader("-10,1", "+11,0"),
             ],
             [],
         )
@@ -139,7 +139,7 @@ mod to_additive_hunks {
             [
                 HunkHeader("-1,10", "+1,10"),
                 HunkHeader("-15,2", "+20,0"),
-                HunkHeader("-17,0", "+22,3"),
+                HunkHeader("-19,0", "+22,3"),
             ],
             [],
         )
@@ -373,7 +373,7 @@ mod to_additive_hunks {
         insta::assert_debug_snapshot!(actual, @r#"
         (
             [
-                HunkHeader("-1,0", "+3,1"),
+                HunkHeader("-3,0", "+3,1"),
             ],
             [],
         )
@@ -426,13 +426,10 @@ mod to_additive_hunks {
         insta::assert_debug_snapshot!(actual, @r#"
         (
             [
-                HunkHeader("-2,2", "+1,0"),
-                HunkHeader("-6,2", "+1,0"),
-                HunkHeader("-9,1", "+1,0"),
-                HunkHeader("-10,1", "+1,0"),
-                HunkHeader("-11,0", "+1,1"),
-                HunkHeader("-11,0", "+5,2"),
-                HunkHeader("-11,0", "+9,2"),
+                HunkHeader("-2,2", "+1,1"),
+                HunkHeader("-6,2", "+5,2"),
+                HunkHeader("-9,1", "+9,2"),
+                HunkHeader("-10,1", "+11,0"),
             ],
             [],
         )

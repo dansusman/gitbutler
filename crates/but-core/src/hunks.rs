@@ -282,4 +282,119 @@ mod test {
             assert!(!right.intersects(left));
         }
     }
+
+    /// Regression coverage for the multi-pure-add bug observed in the
+    /// `splittest_pure_add.md` field repro: when a single worktree hunk
+    /// holds multiple disjoint sub-ranges of additions and the user
+    /// commits the additions individually, the
+    /// `to_additive_hunks` + [`apply_hunks`] pipeline must interleave
+    /// the new content correctly with the surrounding old content.
+    ///
+    /// Each test runs the full pipeline (encoded sub-hunks →
+    /// `to_additive_hunks` → `apply_hunks`) so we can pin the
+    /// commit-time semantics end-to-end.
+    mod apply_hunks_multi_pure_add {
+        use crate::hunks::apply_hunks;
+        use crate::tree::test_helpers::to_additive_hunks_for_test;
+        use crate::HunkHeader;
+        use bstr::ByteSlice;
+
+        fn h(old_start: u32, old_lines: u32, new_start: u32, new_lines: u32) -> HunkHeader {
+            HunkHeader {
+                old_start,
+                old_lines,
+                new_start,
+                new_lines,
+            }
+        }
+
+        /// One pure-add hunk inside a worktree hunk that also has a
+        /// shared context row. The encoded sub-hunk header is
+        /// `(-0,0 +2,1)`; `to_additive_hunks` must rewrite it to
+        /// `(-2,0 +2,1)` (anchor *after* the shared row), not
+        /// `(-1,0 +2,1)` which would land the new content before the
+        /// shared row.
+        #[test]
+        fn pure_add_after_existing_old_row_lands_after_old() {
+            let old = b"X\n";
+            let new = b"X\nB\n";
+            let wh = vec![h(1, 1, 1, 2)]; // worktree hunk with 0 context
+            let (hunks, rejected) =
+                to_additive_hunks_for_test(vec![h(0, 0, 2, 1)], &wh, &wh).unwrap();
+            assert_eq!(rejected, &[] as &[HunkHeader]);
+            let result = apply_hunks(old.as_bstr(), new.as_bstr(), &hunks).unwrap();
+            assert_eq!(
+                result.as_bstr(),
+                b"X\nB\n".as_bstr(),
+                "B should land after X, not before",
+            );
+        }
+
+        /// Two disjoint pure-adds straddling a shared context row in
+        /// the same worktree hunk. Expected:
+        /// `"A\nX\nB\n"` but the pre-fix pipeline produces
+        /// `"A\nB\nX\n"` (everything new bunched at the front).
+        #[test]
+        fn two_pure_adds_straddling_shared_old_row() {
+            let old = b"X\n";
+            let new = b"A\nX\nB\n";
+            let wh = vec![h(1, 1, 1, 3)];
+            let (hunks, rejected) =
+                to_additive_hunks_for_test(vec![h(0, 0, 1, 1), h(0, 0, 3, 1)], &wh, &wh).unwrap();
+            assert_eq!(rejected, &[] as &[HunkHeader]);
+            let result = apply_hunks(old.as_bstr(), new.as_bstr(), &hunks).unwrap();
+            assert_eq!(
+                result.as_bstr(),
+                b"A\nX\nB\n".as_bstr(),
+                "A goes before X, B goes after X (interleaved)",
+            );
+        }
+
+        /// Same shape but with three pure-adds and two shared rows,
+        /// validating the running offset survives multiple iterations.
+        #[test]
+        fn three_pure_adds_around_two_shared_rows() {
+            let old = b"X\nY\n";
+            let new = b"A\nX\nB\nY\nC\n";
+            let wh = vec![h(1, 2, 1, 5)];
+            let (hunks, rejected) = to_additive_hunks_for_test(
+                vec![h(0, 0, 1, 1), h(0, 0, 3, 1), h(0, 0, 5, 1)],
+                &wh,
+                &wh,
+            )
+            .unwrap();
+            assert_eq!(rejected, &[] as &[HunkHeader]);
+            let result = apply_hunks(old.as_bstr(), new.as_bstr(), &hunks).unwrap();
+            assert_eq!(
+                result.as_bstr(),
+                b"A\nX\nB\nY\nC\n".as_bstr(),
+                "each pure-add slots between the two shared rows correctly",
+            );
+        }
+
+        /// The field-observed shape: pre-commit baseline has
+        /// `\n## Section B\n- beta one\n` (3 rows, the leading blank +
+        /// the B header + the first beta), worktree adds Section A on
+        /// top and Section C at the bottom; user commits Section A
+        /// only. Expected: HEAD gains Section A above the baseline.
+        #[test]
+        fn commit_section_a_above_existing_section_b() {
+            let old = b"\n## Section B\n- beta one\n";
+            let new = b"## Section A\n- alpha one\n\n## Section B\n- beta one\n## Section C\n- gamma one\n";
+            // Worktree no-context hunk shape:
+            //   -1,3 +1,7 (3 old shared rows, 7 new rows total).
+            let wh = vec![h(1, 3, 1, 7)];
+            // User commits the leading 2 rows ("## Section A", "- alpha one")
+            // as one pure-add sub-hunk.
+            let (hunks, rejected) =
+                to_additive_hunks_for_test(vec![h(0, 0, 1, 2)], &wh, &wh).unwrap();
+            assert_eq!(rejected, &[] as &[HunkHeader]);
+            let result = apply_hunks(old.as_bstr(), new.as_bstr(), &hunks).unwrap();
+            assert_eq!(
+                result.as_bstr(),
+                b"## Section A\n- alpha one\n\n## Section B\n- beta one\n".as_bstr(),
+                "Section A inserted on top; existing baseline (blank + Section B + beta one) preserved verbatim",
+            );
+        }
+    }
 }

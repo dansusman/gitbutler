@@ -373,13 +373,21 @@ fn to_additive_hunks(
 ) -> anyhow::Result<(Vec<HunkHeader>, Vec<HunkHeader>)> {
     let mut hunks_to_commit = Vec::new();
     let mut rejected = Vec::new();
-    let mut previous = HunkHeader {
-        old_start: 1,
-        old_lines: 0,
-        new_start: 1,
-        new_lines: 0,
-    };
     let mut last_wh = None;
+    // Phase: split-aware partial commits.
+    //
+    // When several disjoint sub-ranges of the *same* worktree hunk are
+    // committed in one operation (the user splits a hunk into N sub-hunks
+    // and stages multiple of them), each emitted pure-add or pure-remove
+    // header needs its own anchor inside the worktree hunk's row space.
+    // Anchoring everything at `wh.old_start` / `wh.new_start` collapses
+    // them to one position and `apply_hunks` then bunches all the new
+    // content at that point with the surrounding old content trailing
+    // after — producing reordered (and visibly duplicated) blobs in the
+    // resulting commit. These running totals let the loop compute the
+    // correct in-wh offset for each subsequent sub-range.
+    let mut pure_add_rows_in_wh: u32 = 0;
+    let mut pure_remove_rows_in_wh: u32 = 0;
     for selected_hunk in hunks_to_keep {
         let sh = selected_hunk;
         if sh.new_range().is_null() {
@@ -389,15 +397,26 @@ fn to_additive_hunks(
             {
                 if last_wh != Some(*wh) {
                     last_wh = Some(*wh);
-                    previous.new_start = wh.new_start;
+                    pure_add_rows_in_wh = 0;
+                    pure_remove_rows_in_wh = 0;
                 }
+                // Each preceding row inside `wh.old_range` is either a
+                // pure-remove (already emitted) or a context row that
+                // maps 1:1 to a row in `wh.new_range`. Anchor the
+                // emitted new_start past the context rows that precede
+                // this remove plus any pure-add rows already inserted
+                // earlier in this wh (those have consumed positions in
+                // the new-side row space).
+                let preceding_old = sh.old_start.saturating_sub(wh.old_start);
+                let preceding_context = preceding_old.saturating_sub(pure_remove_rows_in_wh);
+                let new_start = wh.new_start + preceding_context + pure_add_rows_in_wh;
                 hunks_to_commit.push(HunkHeader {
                     old_start: sh.old_start,
                     old_lines: sh.old_lines,
-                    new_start: previous.new_start,
+                    new_start,
                     new_lines: 0,
                 });
-                previous.old_start = sh.old_range().end();
+                pure_remove_rows_in_wh += sh.old_lines;
                 continue;
             }
         } else if sh.old_range().is_null() {
@@ -407,21 +426,31 @@ fn to_additive_hunks(
             {
                 if last_wh != Some(*wh) {
                     last_wh = Some(*wh);
-                    previous.old_start = wh.old_start;
+                    pure_add_rows_in_wh = 0;
+                    pure_remove_rows_in_wh = 0;
                 }
+                // Symmetric to the pure-remove case: each preceding row
+                // inside `wh.new_range` is either a pure-add already
+                // emitted to this wh or a context row that consumes one
+                // old row. Anchor the emitted old_start past the context
+                // rows that precede this add plus any pure-remove rows
+                // already consumed earlier in this wh.
+                let preceding_new = sh.new_start.saturating_sub(wh.new_start);
+                let preceding_context = preceding_new.saturating_sub(pure_add_rows_in_wh);
+                let old_start = wh.old_start + preceding_context + pure_remove_rows_in_wh;
                 hunks_to_commit.push(HunkHeader {
-                    old_start: previous.old_start,
+                    old_start,
                     old_lines: 0,
                     new_start: sh.new_start,
                     new_lines: sh.new_lines,
                 });
-                previous.new_start = sh.new_range().end();
+                pure_add_rows_in_wh += sh.new_lines;
                 continue;
             }
         } else if worktree_hunks.contains(&sh) {
-            previous.old_start = sh.old_range().end();
-            previous.new_start = sh.new_range().end();
             last_wh = Some(sh);
+            pure_add_rows_in_wh = 0;
+            pure_remove_rows_in_wh = 0;
             hunks_to_commit.push(sh);
             continue;
         }
@@ -584,3 +613,19 @@ fn to_additive_hunks_fallback(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use super::*;
+
+    /// Test-only re-export of [`to_additive_hunks`] so sibling modules
+    /// (e.g. the `hunks::test::apply_hunks_multi_pure_add` regression
+    /// suite) can exercise the encode → apply pipeline end-to-end.
+    pub fn to_additive_hunks_for_test(
+        hunks_to_keep: Vec<HunkHeader>,
+        worktree_hunks: &[HunkHeader],
+        worktree_hunks_no_context: &[HunkHeader],
+    ) -> anyhow::Result<(Vec<HunkHeader>, Vec<HunkHeader>)> {
+        super::to_additive_hunks(hunks_to_keep, worktree_hunks, worktree_hunks_no_context)
+    }
+}

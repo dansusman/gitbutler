@@ -30,7 +30,7 @@ Last updated: end of "phase 5 polish + sub-hunk re-split + 6.5a" session.
 | 6.5e — Size guard (`MAX_OVERRIDE_DB_BYTES = 64 KB`) | **Shipped (this session)** | _pending_ |
 | 6.5d-followup — Wire `reconcile_with_overrides_persistent` into `assignments_with_fallback` / `assign` (write-through on partial-commit migration / drops) | **Shipped (this session)** | _pending_ |
 | **7 — Splitting committed work + cross-stack moves of split pieces** | **In progress** (7a/7b/7c-1..5/7d/7e/7f/7g/7h shipped) | _pending_ |
-| **⚠ Open: partial-commit content duplication on pure-add sub-hunks** | **Investigating** | — |
+| **⚠ Open: partial-commit content duplication on pure-add sub-hunks** | **Fixed** (this session) | _pending_ |
 
 ## What's validated end-to-end (manual GUI smoke test against `~/buttest`)
 
@@ -2771,3 +2771,158 @@ responsibility.
    7; needs trace logging in `to_additive_hunks` /
    `safe_checkout`.
 4. **CLI parity** — still punted.
+
+## What landed in the partial-commit duplication fix session
+
+### Root cause: `to_additive_hunks` collapses per-add anchors
+
+The "⚠ Open issue — partial-commit content duplication on pure-add
+sub-hunks" symptom (Section A appearing 3× in HEAD after splitting +
+partial-committing pure-add sub-hunks; user-visible repro on
+`~/buttest/splittest_pure_add.md`'s commit `29b67c0 "fdfdfdf"`) was
+not caused by sub-hunk encoding or the override store.
+
+The bug lived in `crates/but-core/src/tree/mod.rs::to_additive_hunks`.
+For multiple pure-add headers `(-0,0 +N,K)` against the same worktree
+no-context hunk `wh = (-A,B +C,D)`, the function emitted
+`(wh.old_start, 0, N, K)` for **every** pure-add — i.e. anchored them
+all at the same `old_start = wh.old_start`.
+
+Downstream, `apply_hunks` consumed those headers in order. With
+`old_lines = 0` and `old_start` equal across headers, each iteration
+bypassed the catchup-old loop (`old_skips = old_start - old_cursor =
+0`) and just took new content. The trailing-old loop at the end then
+appended *all* the remaining old content past the new content,
+producing reordered blobs. When the same logical commit landed
+multiple times across failed/uncommit cycles, the duplicates
+accumulated in the worktree (3-way merge with `KeepAndPreferTheirs`
+preserved the worktree-side superset on each iteration).
+
+### Fix
+
+`to_additive_hunks`'s primary path now tracks running totals of
+pure-add and pure-remove rows it has emitted *within the current
+worktree hunk*, and computes per-header offsets from those totals.
+
+For a pure-add at `(0, 0, sh.new_start, sh.new_lines)` inside
+`wh = (-A,B +C,D)`:
+
+```
+preceding_new      = sh.new_start - wh.new_start
+preceding_context  = preceding_new - pure_add_rows_in_wh
+old_start          = wh.old_start + preceding_context + pure_remove_rows_in_wh
+```
+
+Symmetric for pure-remove (swap `old`/`new`). The running totals
+reset whenever the iteration moves to a different `wh` or sees a
+full-match worktree hunk.
+
+This is the right fix because:
+
+- For a pure-add inside `wh`, every preceding row in `wh.new_range`
+  is either a row already covered by an earlier pure-add (i.e.
+  `pure_add_rows_in_wh`) or a context row that maps 1:1 to a row in
+  `wh.old_range` (i.e. `preceding_context`). The first kind doesn't
+  consume an old position; the second does. The new header's
+  `old_start` therefore needs to land past the consumed old
+  positions plus the rows already removed by earlier pure-removes
+  (those advanced `apply_hunks`'s old_cursor already).
+- For consecutive pure-adds in the same `wh`, each gets a distinct
+  `old_start` so `apply_hunks` correctly interleaves new content
+  with the surrounding old content rather than bunching everything
+  at the front.
+
+### Tests
+
+Four new pinning unit tests in
+`crates/but-core/src/hunks.rs::test::apply_hunks_multi_pure_add`
+exercise the `to_additive_hunks` → `apply_hunks` pipeline end-to-end
+for the bug shape:
+
+- `pure_add_after_existing_old_row_lands_after_old` — single
+  pure-add inside a wh that has one shared row; new content must
+  land *after* the shared row, not before.
+- `two_pure_adds_straddling_shared_old_row` — the "A above, B below
+  X" shape that demonstrated the bug clearly: expected `A\nX\nB\n`,
+  pre-fix produced `A\nB\nX\n`.
+- `three_pure_adds_around_two_shared_rows` — the running-offset
+  invariant under more iterations.
+- `commit_section_a_above_existing_section_b` — the field-observed
+  shape from `~/buttest`'s `splittest_pure_add.md`.
+
+A new `crate::tree::test_helpers::to_additive_hunks_for_test`
+module exposes `to_additive_hunks` to sibling test modules so the
+above tests can drive the full pipeline.
+
+### Snapshots updated
+
+Five pre-existing insta snapshots changed because they pinned the
+buggy "everything anchored at `wh.*_start`" behavior:
+
+- `but-core::tree::tests::to_additive_hunks::only_selections` (4
+  inline snapshots) — pure-removes now get distinct `new_start`s,
+  pure-adds get distinct `old_start`s.
+- `but-core::tree::tests::to_additive_hunks::only_selections_workspace_example`
+  — same shape; new output collapses to four mixed hunks via the
+  fallback path because the in-order check fires (mixed scenarios
+  push the headers out of strict lex order).
+- `but-core::tree::tests::to_additive_hunks::pure_add_sub_hunk_via_null_side_encoding`
+  — single sub-hunk anchor moves from `(-1,0 +3,1)` to
+  `(-3,0 +3,1)`. Same blob output but the header now correctly
+  identifies its position in old.
+- `but-core::tree::tests::to_additive_hunks::selections_and_full_hunks`
+  — the post-pure-remove pure-add's `old_start` widens from 17 to
+  19 to account for the running pure-remove total, not just the
+  immediately-preceding hunk's `old_lines`.
+- `but-core::tree::tests::to_additive_hunks::worktree_hunks_without_context_lines`
+  (the `(-96,1 +0,0), (-0,0 +96,2)` mixed input) collapses to a
+  single mixed hunk via the fallback. Apply-equivalent.
+
+Two `but-workspace::commit_engine::new_commit::modification_with_complex_selection`
+tree-blob snapshots also updated (interleaved adds vs. bunched
+adds-at-end; both were arguably "wrong" before but the new
+behavior is closer to user intent).
+
+### What's *not* in this session
+
+- **`apply_hunks` mixed-hunk ordering.** For a single mixed hunk
+  `(-A,B +C,D)`, `apply_hunks` always processes catchup-old then
+  take-new. That puts kept-old rows *before* added-new rows even
+  when the added rows belong at a smaller new-position. The
+  workspace example test exercises this and the new blob still
+  has minor "kept-old before added" order quirks (e.g. `1\n11\n`
+  instead of `11\n1\n`). For the user-visible Phase 7 sub-hunk
+  flow this doesn't matter — the desktop's
+  `lineSelection.svelte.ts` and `processHunkHeaders` produce
+  pure-add / pure-remove headers, not mixed ones. Mixed headers
+  arise from full-natural-hunk commits where the user accepts the
+  whole shape, in which case the "kept-old before added" order
+  matches the user's selection-as-shown.
+- **Snapshot review for `crates/but/src/id/tests.rs`.** Eleven
+  failures in that file are unrelated whitespace drift in the
+  `sub_hunk_origin: None,` indentation, pre-existing from before
+  this session.
+
+### Verification
+
+- `cargo test -p but-core -p but-workspace -p but-hunk-assignment
+  -p but-api -p but-server -p but-db` — 52 + 245 + 96 + 9 + 10 +
+  133 + 5 + 1 = all green; 4 new regression tests included.
+- `cargo build -p but-core` — clean, no new warnings.
+- The `~/buttest/splittest_pure_add.md` repro recipe from the plan
+  doc should now produce a clean HEAD blob (Section B + 6 lines)
+  instead of the duplicated 22-row buggy commit. Manual GUI
+  verification still pending — needs the dev app rebuild to pick
+  up the changed `but-core` crate.
+
+### Recommended next-session pickup
+
+1. **Manual GUI verification** of the partial-commit fix against
+   `~/buttest/splittest_pure_add.md` per the plan doc's repro
+   recipe.
+2. **Phase 7i / edit-mode override migration** if those surfaces
+   start carrying commit-keyed overrides in practice.
+3. **Phase 6 polish** — remaining items #2 (icon), #3 (Storybook),
+   #4 (stage-state migration), #6/#7 (right-click options), #8
+   (doc updates).
+4. **Phase 5d Playwright** for the worktree gesture happy-path.

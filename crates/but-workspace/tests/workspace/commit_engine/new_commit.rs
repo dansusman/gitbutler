@@ -681,10 +681,17 @@ fn modification_with_complex_selection() -> anyhow::Result<()> {
     )?;
     assert_eq!(outcome.rejected_specs, [], "everything was assigned");
 
+    // Phase: split-aware partial commits. Pre-fix this snapshot was
+    // "1\n4\n5\n8\n11\n15\n16\n19\n20\n" — every kept-old row first,
+    // then every added row bunched at the end. That representation was
+    // a bug: `to_additive_hunks` collapsed the per-add anchors so
+    // `apply_hunks` couldn't interleave new content with the kept-old
+    // surroundings. The new shape interleaves the adds near where the
+    // user specified them in the new file.
     insta::assert_snapshot!(visualize_tree(&repo, &outcome)?, @r#"
-    4bbd0d5
+    351ad0c
     ├── all-added:100644:e69de29 ""
-    ├── all-modified:100644:fcf7eb0 "1\n4\n5\n8\n11\n15\n16\n19\n20\n"
+    ├── all-modified:100644:0ce96f9 "1\n11\n4\n5\n15\n16\n8\n19\n20\n"
     └── all-removed:100644:f00c965 "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"
     "#);
 
@@ -723,10 +730,18 @@ fn modification_with_complex_selection() -> anyhow::Result<()> {
     )?;
     assert_eq!(outcome.rejected_specs, [], "everything was assigned");
 
+    // Same shape as the previous selection but with line-by-line
+    // (1-row) hunks like the UI emits. The line-by-line variant
+    // exercises the fallback path inside `to_additive_hunks` since the
+    // primary path's in-order check fails when pure-removes and
+    // pure-adds are interleaved across the same worktree hunk; the
+    // fallback merges adjacent removes/adds into mixed hunks. Pre-fix
+    // both variants produced the same bunched-up
+    // "1\n4\n5\n8\n11\n15\n16\n19\n20\n" output.
     insta::assert_snapshot!(visualize_tree(&repo, &outcome)?, @r#"
-    4bbd0d5
+    a275be8
     ├── all-added:100644:e69de29 ""
-    ├── all-modified:100644:fcf7eb0 "1\n4\n5\n8\n11\n15\n16\n19\n20\n"
+    ├── all-modified:100644:5a68944 "1\n11\n15\n4\n5\n16\n19\n8\n20\n"
     └── all-removed:100644:f00c965 "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"
     "#);
     Ok(())
