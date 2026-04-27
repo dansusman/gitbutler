@@ -39,19 +39,28 @@ pub(crate) fn commit_insert_blank_only_impl(
     dry_run: DryRun,
     perm: &mut RepoExclusive,
 ) -> anyhow::Result<CommitInsertBlankResult> {
-    let mut meta = ctx.meta()?;
-    let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(perm)?;
-    let editor = Editor::create(&mut ws, &mut meta, &repo)?;
+    let result = {
+        let mut meta = ctx.meta()?;
+        let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(perm)?;
+        let editor = Editor::create(&mut ws, &mut meta, &repo)?;
 
-    let (rebase, blank_commit_selector) =
-        but_workspace::commit::insert_blank_commit(editor, side, relative_to)?;
-    let new_commit = rebase.lookup_pick(blank_commit_selector)?;
-    let workspace = WorkspaceState::from_successful_rebase(rebase, &repo, dry_run)?;
+        let (rebase, blank_commit_selector) =
+            but_workspace::commit::insert_blank_commit(editor, side, relative_to)?;
+        let new_commit = rebase.lookup_pick(blank_commit_selector)?;
+        let workspace = WorkspaceState::from_successful_rebase(rebase, &repo, dry_run)?;
 
-    Ok(CommitInsertBlankResult {
-        new_commit,
-        workspace,
-    })
+        CommitInsertBlankResult {
+            new_commit,
+            workspace,
+        }
+    };
+    super::sub_hunk::migrate_overrides_after_workspace_rewrite(
+        ctx,
+        &result.workspace,
+        dry_run,
+        perm,
+    )?;
+    Ok(result)
 }
 
 /// Inserts a blank commit on `side` of `relative_to` and records an oplog

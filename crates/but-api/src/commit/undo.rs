@@ -99,6 +99,25 @@ pub fn commit_undo_only_with_perm(
     dry_run: DryRun,
     perm: &mut RepoExclusive,
 ) -> anyhow::Result<CommitUndoResult> {
+    let result = commit_undo_only_with_perm_inner(
+        ctx, subject_commit_id, assign_to, dry_run, perm,
+    )?;
+    super::sub_hunk::migrate_overrides_after_workspace_rewrite(
+        ctx,
+        &result.workspace,
+        dry_run,
+        perm,
+    )?;
+    Ok(result)
+}
+
+fn commit_undo_only_with_perm_inner(
+    ctx: &mut but_ctx::Context,
+    subject_commit_id: gix::ObjectId,
+    assign_to: Option<but_core::ref_metadata::StackId>,
+    dry_run: DryRun,
+    perm: &mut RepoExclusive,
+) -> anyhow::Result<CommitUndoResult> {
     let context_lines = ctx.settings.context_lines;
     let mut meta = ctx.meta()?;
     let (repo, mut ws, mut db) = ctx.workspace_mut_and_db_mut_with_perm(perm)?;

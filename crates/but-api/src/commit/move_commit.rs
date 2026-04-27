@@ -58,6 +58,31 @@ pub fn commit_move_only_with_perm(
         bail!("No commits were provided to move")
     }
 
+    let result = commit_move_only_with_perm_inner(
+        ctx,
+        subject_commit_ids,
+        relative_to,
+        side,
+        dry_run,
+        perm,
+    )?;
+    super::sub_hunk::migrate_overrides_after_workspace_rewrite(
+        ctx,
+        &result.workspace,
+        dry_run,
+        perm,
+    )?;
+    Ok(result)
+}
+
+fn commit_move_only_with_perm_inner(
+    ctx: &mut but_ctx::Context,
+    subject_commit_ids: Vec<gix::ObjectId>,
+    relative_to: RelativeTo,
+    side: InsertSide,
+    dry_run: DryRun,
+    perm: &mut RepoExclusive,
+) -> anyhow::Result<CommitMoveResult> {
     let mut meta = ctx.meta()?;
     let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(perm)?;
     let editor = Editor::create(&mut ws, &mut meta, &repo)?;

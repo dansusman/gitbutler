@@ -24,6 +24,10 @@ use but_hunk_assignment::{HunkAssignment, RowRange};
 use gix::prelude::ObjectIdExt;
 use tracing::instrument;
 
+use std::collections::BTreeMap;
+
+use crate::WorkspaceState;
+
 use super::{
     move_changes::commit_move_changes_between_with_perm,
     types::MoveChangesResult,
@@ -159,9 +163,7 @@ pub fn move_sub_hunk_with_perm(
         dry_run,
         perm,
     )?;
-    if dry_run == DryRun::No {
-        migrate_overrides_after_rewrite(ctx, &result, perm)?;
-    }
+    migrate_overrides_after_workspace_rewrite(ctx, &result.workspace, dry_run, perm)?;
     Ok(result)
 }
 
@@ -219,9 +221,7 @@ pub fn uncommit_sub_hunk_with_perm(
     let spec = encode_sub_hunk_diff_spec(ctx, commit_id, path, anchor, range)?;
     let result =
         commit_uncommit_changes_with_perm(ctx, commit_id, vec![spec], assign_to, dry_run, perm)?;
-    if dry_run == DryRun::No {
-        migrate_overrides_after_rewrite(ctx, &result, perm)?;
-    }
+    migrate_overrides_after_workspace_rewrite(ctx, &result.workspace, dry_run, perm)?;
     Ok(result)
 }
 
@@ -269,21 +269,41 @@ fn commit_diff_assignments(
     Ok(out)
 }
 
-/// Phase 7f: walk `result.workspace.replaced_commits` and migrate every
-/// commit-anchored override keyed on a rewritten `old_id` onto the
-/// corresponding `new_id` via
+/// Phase 7f / 7h: walk a [`WorkspaceState`]'s `replaced_commits` map and
+/// migrate every commit-anchored override keyed on a rewritten `old_id` onto
+/// the corresponding `new_id` via
 /// [`but_hunk_assignment::migrate_commit_overrides_persistent`].
 ///
-/// Errors during migration are logged and swallowed: the move/uncommit
-/// itself already succeeded, and a migration failure should not be
-/// surfaced as an RPC error to the user. Pathological cases (corrupt
-/// row, missing commit object) drop the override; the user can re-split.
-fn migrate_overrides_after_rewrite(
+/// Skips when `dry_run` is enabled — the rebase wasn't materialized so the
+/// `new_id`s are previews that don't exist in the object database.
+///
+/// Errors during migration are logged and swallowed: the rewrite itself
+/// already succeeded, and a migration failure should not be surfaced as an
+/// RPC error to the user. Pathological cases (corrupt row, missing commit
+/// object) drop the override; the user can re-split.
+///
+/// Phase 7h: this helper is the canonical post-rewrite hook called by every
+/// commit-rewriting RPC in `crate::commit` (amend, squash, reword, undo,
+/// move_commit, insert_blank, discard_commit, move_changes, plus 7d's
+/// move_sub_hunk / uncommit_sub_hunk). Centralizing here avoids having to
+/// remember to migrate from each new rewriting RPC.
+pub(crate) fn migrate_overrides_after_workspace_rewrite(
     ctx: &mut Context,
-    result: &MoveChangesResult,
+    workspace: &WorkspaceState,
+    dry_run: DryRun,
     perm: &mut RepoExclusive,
 ) -> anyhow::Result<()> {
-    let mappings = &result.workspace.replaced_commits;
+    if dry_run == DryRun::Yes {
+        return Ok(());
+    }
+    migrate_overrides_for_replacements(ctx, &workspace.replaced_commits, perm)
+}
+
+fn migrate_overrides_for_replacements(
+    ctx: &mut Context,
+    mappings: &BTreeMap<gix::ObjectId, gix::ObjectId>,
+    perm: &mut RepoExclusive,
+) -> anyhow::Result<()> {
     if mappings.is_empty() {
         return Ok(());
     }
@@ -302,7 +322,7 @@ fn migrate_overrides_after_rewrite(
                     old_id = %old_id,
                     new_id = %new_id,
                     error = ?err,
-                    "phase 7f: could not build new-commit assignments; skipping migration",
+                    "phase 7f/7h: could not build new-commit assignments; skipping migration",
                 );
                 continue;
             }
@@ -319,7 +339,7 @@ fn migrate_overrides_after_rewrite(
                 old_id = %old_id,
                 new_id = %new_id,
                 error = ?err,
-                "phase 7f: migration helper returned error; skipping",
+                "phase 7f/7h: migration helper returned error; skipping",
             );
         }
     }

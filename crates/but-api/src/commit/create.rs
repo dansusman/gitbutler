@@ -57,33 +57,42 @@ pub(crate) fn commit_create_only_impl(
     context_lines: u32,
     perm: &mut RepoExclusive,
 ) -> anyhow::Result<CommitCreateResult> {
-    let mut meta = ctx.meta()?;
-    let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(perm)?;
-    let editor = Editor::create(&mut ws, &mut meta, &repo)?;
+    let result = {
+        let mut meta = ctx.meta()?;
+        let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(perm)?;
+        let editor = Editor::create(&mut ws, &mut meta, &repo)?;
 
-    let but_workspace::commit::CommitCreateOutcome {
-        rebase,
-        commit_selector,
-        rejected_specs,
-    } = but_workspace::commit::commit_create(
-        editor,
-        changes,
-        relative_to,
-        side,
-        &message,
-        context_lines,
+        let but_workspace::commit::CommitCreateOutcome {
+            rebase,
+            commit_selector,
+            rejected_specs,
+        } = but_workspace::commit::commit_create(
+            editor,
+            changes,
+            relative_to,
+            side,
+            &message,
+            context_lines,
+        )?;
+
+        let new_commit = commit_selector
+            .map(|commit_selector| rebase.lookup_pick(commit_selector))
+            .transpose()?;
+        let workspace = WorkspaceState::from_successful_rebase(rebase, &repo, dry_run)?;
+
+        CommitCreateResult {
+            new_commit,
+            rejected_specs,
+            workspace,
+        }
+    };
+    super::sub_hunk::migrate_overrides_after_workspace_rewrite(
+        ctx,
+        &result.workspace,
+        dry_run,
+        perm,
     )?;
-
-    let new_commit = commit_selector
-        .map(|commit_selector| rebase.lookup_pick(commit_selector))
-        .transpose()?;
-    let workspace = WorkspaceState::from_successful_rebase(rebase, &repo, dry_run)?;
-
-    Ok(CommitCreateResult {
-        new_commit,
-        rejected_specs,
-        workspace,
-    })
+    Ok(result)
 }
 
 /// Insert a new commit built from `changes` and record an oplog snapshot on

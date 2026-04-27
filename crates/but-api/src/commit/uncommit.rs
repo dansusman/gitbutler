@@ -56,6 +56,26 @@ pub fn commit_uncommit_changes_only_with_perm(
     dry_run: DryRun,
     perm: &mut but_ctx::access::RepoExclusive,
 ) -> anyhow::Result<MoveChangesResult> {
+    let result = commit_uncommit_changes_only_with_perm_inner(
+        ctx, commit_id, changes, assign_to, dry_run, perm,
+    )?;
+    super::sub_hunk::migrate_overrides_after_workspace_rewrite(
+        ctx,
+        &result.workspace,
+        dry_run,
+        perm,
+    )?;
+    Ok(result)
+}
+
+fn commit_uncommit_changes_only_with_perm_inner(
+    ctx: &mut but_ctx::Context,
+    commit_id: gix::ObjectId,
+    changes: Vec<but_core::DiffSpec>,
+    assign_to: Option<but_core::ref_metadata::StackId>,
+    dry_run: DryRun,
+    perm: &mut but_ctx::access::RepoExclusive,
+) -> anyhow::Result<MoveChangesResult> {
     let context_lines = ctx.settings.context_lines;
     let mut meta = ctx.meta()?;
     let (repo, mut ws, mut db) = ctx.workspace_mut_and_db_mut_with_perm(perm)?;

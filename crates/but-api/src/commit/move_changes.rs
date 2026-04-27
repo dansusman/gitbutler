@@ -51,21 +51,30 @@ pub fn commit_move_changes_between_only_with_perm(
     dry_run: DryRun,
     perm: &mut RepoExclusive,
 ) -> anyhow::Result<MoveChangesResult> {
-    let context_lines = ctx.settings.context_lines;
-    let mut meta = ctx.meta()?;
-    let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(perm)?;
-    let editor = Editor::create(&mut ws, &mut meta, &repo)?;
+    let result = {
+        let context_lines = ctx.settings.context_lines;
+        let mut meta = ctx.meta()?;
+        let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(perm)?;
+        let editor = Editor::create(&mut ws, &mut meta, &repo)?;
 
-    let outcome = but_workspace::commit::move_changes_between_commits(
-        editor,
-        source_commit_id,
-        destination_commit_id,
-        changes,
-        context_lines,
+        let outcome = but_workspace::commit::move_changes_between_commits(
+            editor,
+            source_commit_id,
+            destination_commit_id,
+            changes,
+            context_lines,
+        )?;
+        let workspace = WorkspaceState::from_successful_rebase(outcome.rebase, &repo, dry_run)?;
+
+        MoveChangesResult { workspace }
+    };
+    super::sub_hunk::migrate_overrides_after_workspace_rewrite(
+        ctx,
+        &result.workspace,
+        dry_run,
+        perm,
     )?;
-    let workspace = WorkspaceState::from_successful_rebase(outcome.rebase, &repo, dry_run)?;
-
-    Ok(MoveChangesResult { workspace })
+    Ok(result)
 }
 
 /// Moves `changes` from `source_commit_id` to `destination_commit_id` and

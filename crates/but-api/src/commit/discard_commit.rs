@@ -35,18 +35,27 @@ pub fn commit_discard_only_with_perm(
     dry_run: DryRun,
     perm: &mut RepoExclusive,
 ) -> anyhow::Result<CommitDiscardResult> {
-    let mut meta = ctx.meta()?;
-    let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(perm)?;
-    let editor = Editor::create(&mut ws, &mut meta, &repo)?;
+    let result = {
+        let mut meta = ctx.meta()?;
+        let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(perm)?;
+        let editor = Editor::create(&mut ws, &mut meta, &repo)?;
 
-    let rebase = but_workspace::commit::discard_commit(editor, subject_commit_id)?;
+        let rebase = but_workspace::commit::discard_commit(editor, subject_commit_id)?;
 
-    let workspace = WorkspaceState::from_successful_rebase(rebase, &repo, dry_run)?;
+        let workspace = WorkspaceState::from_successful_rebase(rebase, &repo, dry_run)?;
 
-    Ok(CommitDiscardResult {
-        discarded_commit: subject_commit_id,
-        workspace,
-    })
+        CommitDiscardResult {
+            discarded_commit: subject_commit_id,
+            workspace,
+        }
+    };
+    super::sub_hunk::migrate_overrides_after_workspace_rewrite(
+        ctx,
+        &result.workspace,
+        dry_run,
+        perm,
+    )?;
+    Ok(result)
 }
 
 /// Discard `subject_commit_id` using the behavior described by

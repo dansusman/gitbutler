@@ -29,7 +29,7 @@ Last updated: end of "phase 5 polish + sub-hunk re-split + 6.5a" session.
 | 6.5d — Write-through on `split_hunk` / `unsplit_hunk` + read-path hydration in `changes_in_worktree_with_perm` | **Shipped (this session)** | _pending_ |
 | 6.5e — Size guard (`MAX_OVERRIDE_DB_BYTES = 64 KB`) | **Shipped (this session)** | _pending_ |
 | 6.5d-followup — Wire `reconcile_with_overrides_persistent` into `assignments_with_fallback` / `assign` (write-through on partial-commit migration / drops) | **Shipped (this session)** | _pending_ |
-| **7 — Splitting committed work + cross-stack moves of split pieces** | **In progress** (7a/7b/7c-1..5/7d/7e/7f/7g shipped) | _pending_ |
+| **7 — Splitting committed work + cross-stack moves of split pieces** | **In progress** (7a/7b/7c-1..5/7d/7e/7f/7g/7h shipped) | _pending_ |
 | **⚠ Open: partial-commit content duplication on pure-add sub-hunks** | **Investigating** | — |
 
 ## What's validated end-to-end (manual GUI smoke test against `~/buttest`)
@@ -2649,3 +2649,125 @@ worktree case is preserved.
 4. **CLI parity** (Phase 6 #5) — punted indefinitely; needs
    either disk-only access to the override store or
    desktop↔CLI IPC.
+
+## What landed in the phase 7h session
+
+### Phase 7h — Override migration on every commit-rewriting RPC
+
+**Why this exists.** Phase 7f wired `migrate_commit_overrides_persistent`
+into `move_sub_hunk` / `uncommit_sub_hunk` so a sub-hunk drag would
+rekey the source-commit's override onto the rewritten commit id. But
+*every other* commit-rewriting RPC in `crates/but-api/src/commit/` —
+`commit_amend`, `commit_squash`, `commit_reword`, `commit_undo`,
+`commit_create`, `commit_move` (move_commit), `commit_insert_blank`,
+`commit_discard`, and the natural-hunk `commit_move_changes_between`
+variant — left commit-keyed overrides stale on rewritten commits.
+Visible symptom: split a hunk in commit `A`, amend `A`, the rewritten
+commit `A'` rendered as a single natural hunk because its override was
+still keyed on the pre-rewrite `A`. 7h closes that loop universally.
+
+### Refactor
+
+`crates/but-api/src/commit/sub_hunk.rs`:
+
+- Renamed the post-rewrite hook from `migrate_overrides_after_rewrite`
+  (which took `&MoveChangesResult`) to
+  `migrate_overrides_after_workspace_rewrite(ctx, &WorkspaceState,
+  DryRun, &mut RepoExclusive)`. The new signature decouples the helper
+  from `MoveChangesResult` so every commit-rewriting RPC can call it
+  regardless of which `*Result` shape it returns — they all carry a
+  `WorkspaceState` field.
+- The `dry_run` short-circuit lives inside the helper now (returns
+  `Ok(())` when `dry_run == DryRun::Yes`), so call sites don't have
+  to remember to gate on it. The previewed `new_id`s in a dry-run
+  rebase aren't materialized into the object database, so a migration
+  pass would fail to `commit_diff_assignments` against them anyway.
+- The inner loop is factored into `migrate_overrides_for_replacements`
+  so a future caller with a raw `BTreeMap<ObjectId, ObjectId>` mapping
+  (e.g. a custom rebase pipeline that doesn't go through
+  `WorkspaceState`) can call it directly.
+- Marked `pub(crate)` so every commit/* sibling can call it via
+  `super::sub_hunk::migrate_overrides_after_workspace_rewrite(...)`.
+
+### Wiring
+
+Each `*_only_with_perm` (or `*_only_impl`) function in `commit/`
+that ends with a `WorkspaceState::from_successful_rebase` /
+`from_workspace` call now has its body wrapped in a block so the
+`(repo, ws, db)` perm-derived borrows release before the migration
+hook acquires its own `(repo, _, db)` from the same `perm`. The
+hook is then invoked with `(ctx, &result.workspace, dry_run, perm)`
+right before returning `Ok(result)`:
+
+- `commit/amend.rs::commit_amend_only_impl`
+- `commit/squash.rs::commit_squash_only_with_perm`
+- `commit/reword.rs::commit_reword_only_with_perm`
+- `commit/move_changes.rs::commit_move_changes_between_only_with_perm`
+- `commit/insert_blank.rs::commit_insert_blank_only_impl`
+- `commit/discard_commit.rs::commit_discard_only_with_perm`
+- `commit/create.rs::commit_create_only_impl`
+
+For the two functions whose existing body was already deeply nested
+around a `tx`/`db` transaction (`uncommit.rs` and `undo.rs`) the
+inner body was renamed to a private `*_inner` helper and the public
+`*_only_with_perm` shim does:
+1. Call `*_inner(...)` to produce the `*Result`.
+2. Hand `result.workspace` to the migration hook.
+3. Return `Ok(result)`.
+
+`commit_move_only_with_perm` (move_commit.rs) was refactored the
+same way to keep the `perm` borrow tidy.
+
+The two existing 7d call sites in `commit/sub_hunk.rs`
+(`move_sub_hunk_with_perm`, `uncommit_sub_hunk_with_perm`) now go
+through the renamed helper — pre-7h they had their own explicit
+`if dry_run == DryRun::No` gate; that's now the helper's
+responsibility.
+
+### What's *not* in 7h
+
+- **Edit-mode flows** (`crates/gitbutler-edit-mode/src/...`,
+  `crates/but-workspace/src/edit_mode.rs`) bypass the
+  `crate::commit::*` RPCs and rewrite commits directly via
+  `but_workspace::edit_mode`. They still leak stale overrides on
+  exit. Adding the hook there means either threading
+  `WorkspaceState` through edit-mode's return shape or calling
+  `migrate_overrides_for_replacements` from the edit-mode commit
+  point directly. Punt to 7i; edit-mode is also where the
+  worktree-vs-edit-mode branching happens, so the decision wants
+  a separate design pass.
+- **Legacy `crates/but-workspace/src/legacy/tree_manipulation/`
+  paths** (split_branch, split_commit,
+  remove_changes_from_commit_in_stack) — these are the v1-era
+  rebase pipeline. They're called from
+  `crates/but-api/src/legacy/...` only; the v2 commit/* RPCs above
+  are the actively-developed surface. Punt indefinitely.
+- **No new tests.** The migration helper itself is covered by the
+  3 tests added in 7f
+  (`migrate_commit_overrides_rekeys_to_new_commit_when_anchor_unchanged`,
+  `..._drops_when_anchor_missing_in_new_commit`,
+  `..._skips_unaffected_origins`). Each new caller is pure
+  plumbing; coverage will land via integration / Playwright when
+  someone adds a "split → amend → re-render" spec.
+
+### Verification
+
+- `cargo check -p but-api -p gitbutler-tauri -p but-server` — clean,
+  no new warnings.
+- `cargo test -p but-api -p but-hunk-assignment` — `but-api` 9
+  tests, `but-hunk-assignment` 96 tests, all green.
+
+### Recommended next-session pickup
+
+1. **Phase 7i (optional)** — extend the migration hook to edit-mode
+   exit + the legacy `tree_manipulation` rebase paths if those
+   surfaces start carrying commit-keyed overrides in practice.
+   Currently a no-op gap because no UI gesture splits a hunk in
+   either surface.
+2. **Phase 6 polish** items #2 (icon), #3 (Storybook), #4
+   (stage-state migration), #6 (right-click split-before-line), #7
+   (right-click commit-this-line), #8 (doc updates).
+3. **Open partial-commit duplication issue** — independent of phase
+   7; needs trace logging in `to_additive_hunks` /
+   `safe_checkout`.
+4. **CLI parity** — still punted.

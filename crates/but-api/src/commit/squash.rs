@@ -48,20 +48,29 @@ pub fn commit_squash_only_with_perm(
     dry_run: DryRun,
     perm: &mut RepoExclusive,
 ) -> anyhow::Result<CommitSquashResult> {
-    let mut meta = ctx.meta()?;
-    let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(perm)?;
-    let editor = Editor::create(&mut ws, &mut meta, &repo)?;
+    let result = {
+        let mut meta = ctx.meta()?;
+        let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(perm)?;
+        let editor = Editor::create(&mut ws, &mut meta, &repo)?;
 
-    let outcome =
-        but_workspace::commit::squash_commits(editor, subject_commit_id, target_commit_id)?;
+        let outcome =
+            but_workspace::commit::squash_commits(editor, subject_commit_id, target_commit_id)?;
 
-    let new_commit = outcome.rebase.lookup_pick(outcome.commit_selector)?;
-    let workspace = WorkspaceState::from_successful_rebase(outcome.rebase, &repo, dry_run)?;
+        let new_commit = outcome.rebase.lookup_pick(outcome.commit_selector)?;
+        let workspace = WorkspaceState::from_successful_rebase(outcome.rebase, &repo, dry_run)?;
 
-    Ok(CommitSquashResult {
-        new_commit,
-        workspace,
-    })
+        CommitSquashResult {
+            new_commit,
+            workspace,
+        }
+    };
+    super::sub_hunk::migrate_overrides_after_workspace_rewrite(
+        ctx,
+        &result.workspace,
+        dry_run,
+        perm,
+    )?;
+    Ok(result)
 }
 
 /// Squash `subject_commit_id` into `target_commit_id` and record an oplog
